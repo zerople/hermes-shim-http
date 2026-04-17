@@ -55,12 +55,14 @@ Before you start, make sure you have:
 
 - **Node.js 18+**
 - **Python 3.10+** available in `PATH`
+- **Python virtual environment support** available (`python3 -m venv` must work)
+  - on Debian/Ubuntu/WSL, this often means installing `python3-venv`
 - at least one supported CLI installed and working:
   - `claude`
   - `codex`
   - `opencode`
 
-> On first run, the launcher automatically creates a cached Python virtual environment under `~/.cache/hermes-shim-http/` and installs the pinned Python dependencies for you.
+> On first run, the launcher automatically creates a cached Python virtual environment under `~/.cache/hermes-shim-http/` and installs the pinned Python dependencies for you. If that bootstrap fails, run `npx @zerople/hermes-shim-http --doctor` for a preflight summary.
 
 ---
 
@@ -100,14 +102,28 @@ npx @zerople/hermes-shim-http --command codex    --cwd "$(pwd)" --model codex-cl
 npx @zerople/hermes-shim-http --command opencode --cwd "$(pwd)" --model opencode-cli
 ```
 
-### 2) Confirm the server is up
+### 2) Run a preflight check if you want a quick sanity check
+
+```bash
+npx @zerople/hermes-shim-http --doctor --command claude --cwd "$(pwd)"
+```
+
+This prints a short preflight summary covering:
+
+- detected Python interpreter
+- whether Python virtual environments are supported
+- whether your `--cwd` exists
+- whether the wrapped CLI command is available
+- which CLI args are effectively being used after auto defaults
+
+### 3) Confirm the server is up
 
 ```bash
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/v1/models
 ```
 
-### 3) Send a test request
+### 4) Send a test request
 
 ```bash
 curl http://127.0.0.1:8765/v1/chat/completions \
@@ -269,6 +285,7 @@ Current launcher help:
 --timeout TIMEOUT
 --model MODELS
 --profile {auto,claude,codex,opencode,generic}
+--doctor
 ```
 
 ### Common options
@@ -365,6 +382,31 @@ python3 --version
 python --version
 ```
 
+### `Python virtual environment support is missing` / `ensurepip is not available`
+
+The launcher needs `python3 -m venv` to work on first run. If your system Python was installed without venv support, the launcher now reports a friendlier error and suggests the package to install.
+
+On Debian/Ubuntu/WSL, try:
+
+```bash
+sudo apt update
+sudo apt install python3-venv
+```
+
+If your distro uses versioned packages, install the one that matches your Python version instead, for example:
+
+```bash
+sudo apt install python3.12-venv
+# or
+sudo apt install python3.11-venv
+```
+
+You can also run the built-in preflight check:
+
+```bash
+npx @zerople/hermes-shim-http --doctor --command claude --cwd "$(pwd)"
+```
+
 ### My CLI command is not found
 
 Make sure the command you pass in `--command` is already installed and available in your shell:
@@ -400,6 +442,14 @@ Note that `--cwd` only sets the working directory for the **wrapped CLI subproce
 
 That is expected. The launcher creates a cached Python environment and installs dependencies on the first run. Later runs should be faster.
 
+If first-run bootstrap fails, run:
+
+```bash
+npx @zerople/hermes-shim-http --doctor --command claude --cwd "$(pwd)"
+```
+
+before retrying the normal launch command.
+
 ---
 
 ## Development
@@ -410,13 +460,14 @@ Clone the repository and run tests locally:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q
+npm test
 ```
 
 Useful commands:
 
 ```bash
 node bin/hermes-shim-http.js --help
+node bin/hermes-shim-http.js --doctor --command claude --cwd "$(pwd)"
 npm pack
 ```
 

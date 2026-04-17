@@ -27,14 +27,65 @@ function parseJson(text) {
   }
 }
 
-function findPython() {
+function parseCliOptions(argv) {
+  const args = Array.from(argv || []);
+  const options = {
+    command: 'claude',
+    cwd: process.cwd(),
+    profile: 'auto',
+    doctor: false,
+    passthrough: args,
+    providedArgs: [],
+  };
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') {
+      options.providedArgs = args.slice(i + 1);
+      break;
+    }
+    if (arg === '--doctor') {
+      options.doctor = true;
+      continue;
+    }
+    if (arg === '--command' && i + 1 < args.length) {
+      options.command = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--command=')) {
+      options.command = arg.split('=', 2)[1];
+      continue;
+    }
+    if (arg === '--cwd' && i + 1 < args.length) {
+      options.cwd = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--cwd=')) {
+      options.cwd = arg.split('=', 2)[1];
+      continue;
+    }
+    if (arg === '--profile' && i + 1 < args.length) {
+      options.profile = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--profile=')) {
+      options.profile = arg.split('=', 2)[1];
+    }
+  }
+  return options;
+}
+
+function findPython({ spawnSyncImpl = spawnSync, failImpl = fail } = {}) {
   const candidates = process.platform === 'win32'
     ? [['py', ['-3']], ['python', []], ['python3', []]]
     : [['python3', []], ['python', []]];
   const rejections = [];
 
   for (const [command, baseArgs] of candidates) {
-    const probe = spawnSync(
+    const probe = spawnSyncImpl(
       command,
       [
         ...baseArgs,
@@ -54,64 +105,213 @@ function findPython() {
   }
 
   if (rejections.length) {
-    fail('Python 3.10+ is required, but only incompatible interpreters were found in PATH.', rejections.join('\n'));
+    failImpl('Python 3.10+ is required, but only incompatible interpreters were found in PATH.', rejections.join('\n'));
   }
   return null;
 }
 
+function resolveCliArgs({ command = 'claude', profile = 'auto', providedArgs = [] } = {}) {
+  if (Array.isArray(providedArgs) && providedArgs.length) {
+    return Array.from(providedArgs);
+  }
+  const basename = path.basename((command || '').trim()).toLowerCase();
+  let effectiveProfile = profile || 'auto';
+  if (effectiveProfile === 'auto') {
+    effectiveProfile = { claude: 'claude', codex: 'codex', opencode: 'opencode' }[basename] || 'generic';
+  }
+  return { claude: ['-p'], codex: ['exec'], opencode: ['run'], generic: [] }[effectiveProfile] || [];
+}
+
+function commandExists(command, { spawnSyncImpl = spawnSync } = {}) {
+  if (!command) return false;
+  const checkCommand = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSyncImpl(checkCommand, [command], { encoding: 'utf8' });
+  return result.status === 0;
+}
+
+function buildVenvHelpMessage({ pyVersion, detail }) {
+  const parts = String(pyVersion || '').split('.');
+  const majorMinor = parts.length >= 2 ? `${parts[0]}.${parts[1]}` : null;
+  const versionedPkg = majorMinor ? `python${majorMinor}-venv` : null;
+  const packageHint = versionedPkg ? `${versionedPkg} (or python3-venv)` : 'python3-venv';
+  const installHint = versionedPkg
+    ? `sudo apt install ${versionedPkg}`
+    : 'sudo apt install python3-venv';
+  return [
+    'Python virtual environment support is missing on this machine.',
+    `Install ${packageHint} and try again.`,
+    `Suggested command: ${installHint}`,
+    detail ? `Original error: ${detail}` : null,
+  ].filter(Boolean).join('\n');
+}
+
+function checkPythonVenvSupport(py, { spawnSyncImpl = spawnSync } = {}) {
+  const probe = spawnSyncImpl(
+    py.command,
+    [...py.baseArgs, '-c', 'import ensurepip, venv; print("ok")'],
+    { encoding: 'utf8' },
+  );
+
+  if (probe.status === 0) {
+    return { ok: true, message: `Python ${py.version} supports virtual environments.` };
+  }
+
+  const detail = (probe.stderr || probe.stdout || '').trim();
+  return {
+    ok: false,
+    message: buildVenvHelpMessage({ pyVersion: py.version, detail }),
+  };
+}
+
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+  const result = (options.spawnSyncImpl || spawnSync)(command, args, {
     stdio: options.capture ? 'pipe' : 'inherit',
     encoding: 'utf8',
     env: options.env || process.env,
     cwd: options.cwd || packageRoot,
   });
   if (result.status !== 0) {
-    fail(`Command failed: ${command} ${args.join(' ')}`, result.stderr || result.stdout || `exit ${result.status}`);
+    (options.failImpl || fail)(`Command failed: ${command} ${args.join(' ')}`, result.stderr || result.stdout || `exit ${result.status}`);
   }
   return result;
 }
 
-function ensureEnv(py) {
-  fs.mkdirSync(cacheRoot, { recursive: true });
+function ensureEnv(py, options = {}) {
+  const fsImpl = options.fsImpl || fs;
+  const failImpl = options.failImpl || fail;
+  const runImpl = options.runImpl || run;
+  const checkVenvImpl = options.checkPythonVenvSupportImpl || checkPythonVenvSupport;
+  const localCacheRoot = options.cacheRoot || cacheRoot;
+  const localEnvRoot = options.envRoot || envRoot;
+  const localMarkerPath = options.markerPath || markerPath;
+  const localRequirementsPath = options.requirementsPath || requirementsPath;
+  const localRequirementsHash = options.requirementsHash || requirementsHash;
+  const localPkg = options.pkg || pkg;
+
+  fsImpl.mkdirSync(localCacheRoot, { recursive: true });
   const pythonBin = process.platform === 'win32'
-    ? path.join(envRoot, 'Scripts', 'python.exe')
-    : path.join(envRoot, 'bin', 'python');
+    ? path.join(localEnvRoot, 'Scripts', 'python.exe')
+    : path.join(localEnvRoot, 'bin', 'python');
   const pipArgs = ['-m', 'pip'];
 
   let bootstrapNeeded = true;
-  if (fs.existsSync(markerPath)) {
+  if (fsImpl.existsSync(localMarkerPath)) {
     try {
-      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      bootstrapNeeded = !(marker.version === pkg.version && marker.requirementsHash === requirementsHash && fs.existsSync(pythonBin));
+      const marker = JSON.parse(fsImpl.readFileSync(localMarkerPath, 'utf8'));
+      bootstrapNeeded = !(marker.version === localPkg.version && marker.requirementsHash === localRequirementsHash && fsImpl.existsSync(pythonBin));
     } catch (_) {
       bootstrapNeeded = true;
     }
   }
 
   if (bootstrapNeeded) {
-    if (!fs.existsSync(pythonBin)) {
-      fs.rmSync(envRoot, { recursive: true, force: true });
-      fs.mkdirSync(envRoot, { recursive: true });
-      run(py.command, [...py.baseArgs, '-m', 'venv', envRoot]);
+    if (!fsImpl.existsSync(pythonBin)) {
+      const venvCheck = checkVenvImpl(py);
+      if (!venvCheck.ok) {
+        failImpl('Python virtual environment support is missing.', venvCheck.message);
+      }
+      fsImpl.rmSync(localEnvRoot, { recursive: true, force: true });
+      fsImpl.mkdirSync(localEnvRoot, { recursive: true });
+      runImpl(py.command, [...py.baseArgs, '-m', 'venv', localEnvRoot], { failImpl });
     }
-    run(pythonBin, [...pipArgs, 'install', '--upgrade', 'pip']);
-    run(pythonBin, [...pipArgs, 'install', '-r', requirementsPath]);
-    fs.writeFileSync(markerPath, JSON.stringify({ version: pkg.version, requirementsHash }, null, 2));
+    runImpl(pythonBin, [...pipArgs, 'install', '--upgrade', 'pip'], { failImpl });
+    runImpl(pythonBin, [...pipArgs, 'install', '-r', localRequirementsPath], { failImpl });
+    fsImpl.writeFileSync(localMarkerPath, JSON.stringify({ version: localPkg.version, requirementsHash: localRequirementsHash }, null, 2));
   }
   return pythonBin;
 }
 
-(function main() {
+function getDoctorSummary({
+  py,
+  venvCheck,
+  shimCommand,
+  cwd,
+  profile = 'auto',
+  providedArgs = [],
+  existsSyncImpl = fs.existsSync,
+  statSyncImpl = fs.statSync,
+  commandExistsImpl = commandExists,
+  resolveCliArgsImpl = resolveCliArgs,
+} = {}) {
+  const effectiveArgs = resolveCliArgsImpl({ command: shimCommand, profile, providedArgs });
+  const cwdExists = !!existsSyncImpl(cwd);
+  const cwdIsDirectory = cwdExists && !!statSyncImpl(cwd).isDirectory();
+  return {
+    python: py
+      ? { ok: true, version: py.version, executable: py.executable }
+      : { ok: false, message: 'Python 3.10+ was not found in PATH.' },
+    venv: py
+      ? { ok: !!(venvCheck && venvCheck.ok), message: venvCheck ? venvCheck.message : 'unknown' }
+      : { ok: false, message: 'Python was not found, so venv support could not be checked.' },
+    cwd: {
+      ok: cwdIsDirectory,
+      value: cwd,
+      message: !cwdExists
+        ? `Working directory does not exist: ${cwd}`
+        : (cwdIsDirectory ? 'Working directory exists and is a directory.' : `Working directory is not a directory: ${cwd}`),
+    },
+    command: {
+      ok: commandExistsImpl(shimCommand),
+      value: shimCommand,
+      effective_args: effectiveArgs,
+      message: commandExistsImpl(shimCommand)
+        ? `Wrapped CLI command '${shimCommand}' is available in PATH.`
+        : `Wrapped CLI command '${shimCommand}' was not found in PATH.`,
+    },
+  };
+}
+
+function printDoctorSummary(summary) {
+  console.log('[hermes-shim-http] preflight check');
+  console.log(JSON.stringify(summary, null, 2));
+}
+
+function main(argv = process.argv.slice(2)) {
+  const options = parseCliOptions(argv);
   const py = findPython();
   if (!py) fail('Python 3 is required but was not found in PATH.');
-  const pythonBin = ensureEnv(py);
+  const venvCheck = checkPythonVenvSupport(py);
+
+  if (options.doctor) {
+    printDoctorSummary(getDoctorSummary({
+      py,
+      venvCheck,
+      shimCommand: options.command,
+      cwd: options.cwd,
+      profile: options.profile,
+      providedArgs: options.providedArgs,
+    }));
+    if (!venvCheck.ok || !fs.existsSync(options.cwd) || !fs.statSync(options.cwd).isDirectory() || !commandExists(options.command)) {
+      process.exit(1);
+    }
+    return;
+  }
+
+  const pythonBin = ensureEnv(py, { checkPythonVenvSupportImpl: () => venvCheck });
   const env = { ...process.env };
   env.PYTHONPATH = env.PYTHONPATH ? `${packageRoot}${path.delimiter}${env.PYTHONPATH}` : packageRoot;
-  const args = ['-m', 'hermes_shim_http.server', ...process.argv.slice(2)];
+  const args = ['-m', 'hermes_shim_http.server', ...argv];
   const child = spawnSync(pythonBin, args, { stdio: 'inherit', env, cwd: process.cwd() });
   if (typeof child.status === 'number') {
     process.exit(child.status);
   }
   fail('Failed to launch shim process.');
-})();
+}
+
+module.exports = {
+  buildVenvHelpMessage,
+  checkPythonVenvSupport,
+  commandExists,
+  ensureEnv,
+  fail,
+  findPython,
+  getDoctorSummary,
+  main,
+  parseCliOptions,
+  resolveCliArgs,
+  run,
+};
+
+if (require.main === module) {
+  main();
+}

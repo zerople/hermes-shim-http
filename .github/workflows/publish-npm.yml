@@ -63,7 +63,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run tests
-        run: pytest -q
+        run: npm test
       - name: Launcher smoke test
         run: node bin/hermes-shim-http.js --help
       - name: Publish to npm
