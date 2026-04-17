@@ -19,6 +19,7 @@ class ToolDefinition(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: Any = ""
+    tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
 
@@ -54,6 +55,7 @@ class ShimConfig(BaseModel):
     args: List[str] = Field(default_factory=list)
     cwd: str = "."
     timeout: float = 120.0
-    models: List[str] = Field(default_factory=lambda: ["claude-cli"])
+    models: List[str] = Field(default_factory=lambda: ["sonnet", "opus", "haiku"])
     provider_label: str = "cli-http-shim"
     cli_profile: Literal["auto", "claude", "codex", "opencode", "generic"] = "auto"
+    fallback_model: Optional[str] = None

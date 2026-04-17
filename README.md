@@ -17,6 +17,8 @@ This package gives you a local provider endpoint that looks like OpenAI-compatib
 - exposes `chat/completions`, `responses`, and `models` endpoints
 - bootstraps its Python runtime automatically on first run
 - keeps Hermes as the real tool executor when used as a Hermes provider
+- reuses Claude sessions across turns and sends only delta prompts on resumed requests
+- emits structured request/session logs that are readable in normal operation
 
 ---
 
@@ -81,7 +83,7 @@ npx @zerople/hermes-shim-http \
   --port 8765 \
   --command claude \
   --cwd "$(pwd)" \
-  --model claude-cli
+  --model opus
 ```
 
 Or pass an explicit absolute path you know exists. **Replace `/ABSOLUTE/PATH/TO/YOUR/PROJECT` with your own real project directory** — do not copy it literally:
@@ -92,7 +94,7 @@ npx @zerople/hermes-shim-http \
   --port 8765 \
   --command claude \
   --cwd /ABSOLUTE/PATH/TO/YOUR/PROJECT \
-  --model claude-cli
+  --model opus
 ```
 
 If you prefer Codex or OpenCode, the same rule applies — replace `"$(pwd)"` or the absolute path with your own project location:
@@ -129,12 +131,26 @@ curl http://127.0.0.1:8765/v1/models
 curl http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "claude-cli",
+    "model": "opus",
     "messages": [
       {"role": "user", "content": "Say hello in one short sentence."}
     ]
   }'
 ```
+
+---
+
+## What's new in 0.1.7
+
+For Claude-backed usage, `0.1.7` is the first release where the full intended transport is in place:
+
+- fresh requests seed Claude with the shim system prompt
+- follow-up requests reuse Claude sessions with `--resume ... --fork-session`
+- resumed turns send only the transcript delta on stdin
+- normal logs stay focused on request/session summaries
+- extra session-cache mismatch detail is opt-in via `HERMES_SHIM_HTTP_DEBUG_SESSION_CACHE=1`
+
+See [`CHANGELOG.md`](./CHANGELOG.md) or [`docs/releases/v0.1.7.md`](./docs/releases/v0.1.7.md) for release notes.
 
 ---
 
@@ -149,7 +165,7 @@ npx @zerople/hermes-shim-http \
   --port 8765 \
   --command claude \
   --cwd "$(pwd)" \
-  --model claude-cli
+  --model opus
 ```
 
 Then point Hermes to the local provider.
@@ -184,7 +200,7 @@ This is usually the easiest place to start.
 
 ```yaml
 model:
-  default: claude-cli
+  default: opus
   provider: custom
   base_url: http://127.0.0.1:8765/v1
   api_key: no-key-required
@@ -198,7 +214,7 @@ custom_providers:
     base_url: http://127.0.0.1:8765/v1
     api_key: no-key-required
     api_mode: chat_completions
-    model: claude-cli
+    model: opus
 
 fallback_providers: []
 ```
@@ -209,7 +225,7 @@ Use this if you specifically want Hermes to talk to the shim through `/v1/respon
 
 ```yaml
 model:
-  default: claude-cli
+  default: opus
   provider: custom
   base_url: http://127.0.0.1:8765/v1
   api_key: no-key-required
@@ -223,7 +239,7 @@ custom_providers:
     base_url: http://127.0.0.1:8765/v1
     api_key: no-key-required
     api_mode: codex_responses
-    model: claude-cli
+    model: opus
 
 fallback_providers: []
 ```
@@ -242,7 +258,7 @@ This can make editing less stressful for users who want a clear before/after ref
 #   api_key: no-key-required
 
 model:
-  default: claude-cli
+  default: opus
   provider: custom
   base_url: http://127.0.0.1:8765/v1
   api_key: no-key-required
@@ -256,7 +272,7 @@ custom_providers:
     base_url: http://127.0.0.1:8765/v1
     api_key: no-key-required
     api_mode: codex_responses
-    model: claude-cli
+    model: opus
 
 fallback_providers: []
 ```
@@ -306,10 +322,11 @@ Current launcher help:
   Maximum runtime for a single CLI request.
 
 - `--model`  
-  Model name reported back to API clients. This does **not** have to be a real remote model ID; it is mainly the model label your client will send in requests.
+  Model name reported back to API clients. For Claude-backed usage, the built-in model list is `sonnet`, `opus`, and `haiku`, so using one of those names is recommended.
 
 - `--profile`  
   Command profile. `auto` usually picks a sensible default based on `--command`.
+  For Claude with no explicit `-- ...` CLI args, the shim defaults to `-p --dangerously-skip-permissions` so the launcher works out of the box for Hermes-style tool-selection flows.
 
 ---
 

@@ -14,8 +14,12 @@ from . import __version__
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt
-from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt
+from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
+from .telemetry import emit_event
+
+
+_STREAM_FLUSH_INTERVAL_MS = 50
 
 
 def _chat_response(*, model: str, parsed: ParsedShimOutput) -> dict[str, Any]:
@@ -47,7 +51,10 @@ def _chat_response(*, model: str, parsed: ParsedShimOutput) -> dict[str, Any]:
 
 
 def _assistant_messages_from_parsed(parsed: ParsedShimOutput) -> list[dict[str, Any]]:
-    return [{"role": "assistant", "content": parsed.content}]
+    message: dict[str, Any] = {"role": "assistant", "content": parsed.content}
+    if parsed.tool_calls:
+        message["tool_calls"] = parsed.tool_calls
+    return [message]
 
 
 def _normalize_chat_tools(raw_tools: Any, *, strict: bool = False) -> list[dict[str, Any]] | None:
@@ -127,6 +134,106 @@ def _sse_line(payload: dict[str, Any] | str) -> bytes:
     return f"data: {body}\n\n".encode("utf-8")
 
 
+def _message_content_len(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, str):
+                total += len(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+                else:
+                    total += len(json.dumps(item, ensure_ascii=False))
+            else:
+                total += len(str(item))
+        return total
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return len(text)
+        return len(json.dumps(content, ensure_ascii=False))
+    return len(str(content))
+
+
+def _last_user_message_len(messages: list[dict[str, Any]]) -> int:
+    for message in reversed(messages):
+        if str(message.get("role") or "").strip().lower() == "user":
+            return _message_content_len(message.get("content"))
+    return 0
+
+
+def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
+    names: list[str] = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def _safe_json_size_bytes(payload: Any) -> int | None:
+    try:
+        return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _log_chat_request_summary(
+    *,
+    request: ChatCompletionsRequest,
+    request_messages: list[dict[str, Any]],
+    request_tools: list[dict[str, Any]] | None,
+    session_plan: SessionPlan,
+) -> None:
+    emit_event(
+        "chat_completions_request",
+        model=request.model,
+        stream=bool(request.stream),
+        message_count=len(request_messages),
+        message_roles=[str(message.get("role") or "") for message in request_messages],
+        last_user_message_len=_last_user_message_len(request_messages),
+        tool_count=len(request_tools or []),
+        tool_names=_tool_names(request_tools)[:20],
+        tool_choice_present=request.tool_choice is not None,
+        request_json_bytes=_safe_json_size_bytes(
+            {
+                "model": request.model,
+                "stream": request.stream,
+                "messages": request_messages,
+                "tools": request_tools,
+                "tool_choice": request.tool_choice,
+            }
+        ),
+        system_prompt_len=len(session_plan.system_prompt_text or ""),
+        cli_prompt_len=len(session_plan.prompt_text or ""),
+        resume_used=session_plan.resume_session_id is not None,
+        prefix_message_count=session_plan.prefix_message_count,
+    )
+
+
+def _log_responses_request_summary(*, body: dict[str, Any], messages: list[dict[str, Any]], normalized_tools: list[dict[str, Any]] | None, prompt: str) -> None:
+    emit_event(
+        "responses_request",
+        model=str(body.get("model") or ""),
+        stream=bool(body.get("stream")),
+        message_count=len(messages),
+        message_roles=[str(message.get("role") or "") for message in messages],
+        last_user_message_len=_last_user_message_len(messages),
+        tool_count=len(normalized_tools or []),
+        tool_names=_tool_names(normalized_tools)[:20],
+        tool_choice_present=body.get("tool_choice") is not None,
+        request_json_bytes=_safe_json_size_bytes(body),
+        cli_prompt_len=len(prompt or ""),
+    )
+
+
 def _stream_chunk_for_text(*, completion_id: str, created: int, model: str, text: str) -> dict[str, Any]:
     return {
         "id": completion_id,
@@ -194,6 +301,7 @@ def _stream_live_chat_chunks(
     pending_text = ""
     completed_tool_calls: list[dict[str, Any]] = []
     assistant_text_chunks: list[str] = []
+    last_flush_ms = time.monotonic() * 1000
 
     yield _sse_line(
         {
@@ -210,11 +318,15 @@ def _stream_live_chat_chunks(
         config,
         session_id=session_plan.session_id,
         resume_session_id=session_plan.resume_session_id,
+        system_prompt=session_plan.system_prompt_text,
+        model=model,
     ):
         if event.kind == "tool_call" and event.tool_call:
             name = str(event.tool_call.get("function", {}).get("name") or "").strip()
             if allowed_tool_names is not None and name not in allowed_tool_names:
-                pending_text += _unsupported_tool_message([name])
+                unsupported_text = _unsupported_tool_message([name])
+                pending_text += unsupported_text
+                assistant_text_chunks.append(unsupported_text)
                 continue
             yield from _flush_pending_chat_text(
                 completion_id=completion_id,
@@ -223,6 +335,7 @@ def _stream_live_chat_chunks(
                 pending_text=pending_text,
             )
             pending_text = ""
+            last_flush_ms = time.monotonic() * 1000
             saw_tool_calls = True
             completed_tool_calls.append(event.tool_call)
             yield _sse_line(
@@ -238,7 +351,13 @@ def _stream_live_chat_chunks(
         elif event.kind == "text" and event.text:
             pending_text += event.text
             assistant_text_chunks.append(event.text)
-            if "\n" in pending_text or len(pending_text) >= 24 or (event.text[-1:].isspace() and len(pending_text) >= 8):
+            now_ms = time.monotonic() * 1000
+            should_flush = (
+                "\n" in pending_text
+                or len(pending_text) >= 24
+                or (pending_text and now_ms - last_flush_ms >= _STREAM_FLUSH_INTERVAL_MS)
+            )
+            if should_flush:
                 yield from _flush_pending_chat_text(
                     completion_id=completion_id,
                     created=created,
@@ -246,6 +365,7 @@ def _stream_live_chat_chunks(
                     pending_text=pending_text,
                 )
                 pending_text = ""
+                last_flush_ms = now_ms
 
     yield from _flush_pending_chat_text(
         completion_id=completion_id,
@@ -489,7 +609,7 @@ def _stream_live_responses_events(*, model: str, prompt: str, config: ShimConfig
             }
         )
 
-    for event in stream_cli_prompt(prompt, config):
+    for event in stream_cli_prompt(prompt, config, model=model):
         if event.kind == "tool_call" and event.tool_call:
             name = str(event.tool_call.get("function", {}).get("name") or "").strip()
             if allowed_tool_names is not None and name not in allowed_tool_names:
@@ -611,11 +731,35 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         request_messages = [message.model_dump() for message in request.messages]
         request_tools = [tool.model_dump() for tool in request.tools] if request.tools else None
         session_cache: SessionCache = app.state.session_cache
-        session_plan = session_cache.plan_request(
-            messages=request_messages,
-            model=request.model,
-            tools=request_tools,
-            tool_choice=request.tool_choice,
+        if supports_cli_resume(cfg):
+            session_plan = session_cache.plan_request(
+                messages=request_messages,
+                model=request.model,
+                tools=request_tools,
+                tool_choice=request.tool_choice,
+            )
+        else:
+            session_plan = SessionPlan(
+                session_id=str(uuid.uuid4()),
+                resume_session_id=None,
+                prompt_text=build_cli_prompt(
+                    messages=request_messages,
+                    model=request.model,
+                    tools=request_tools,
+                    tool_choice=request.tool_choice,
+                ),
+                system_prompt_text=None,
+                prefix_message_count=0,
+                messages=request_messages,
+                model=request.model,
+                tools=request_tools,
+                tool_choice=request.tool_choice,
+            )
+        _log_chat_request_summary(
+            request=request,
+            request_messages=request_messages,
+            request_tools=request_tools,
+            session_plan=session_plan,
         )
         allowed_tool_names = _allowed_tool_names_from_tools(request_tools)
         if request.stream:
@@ -639,6 +783,8 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             cfg,
             session_id=session_plan.session_id,
             resume_session_id=session_plan.resume_session_id,
+            system_prompt=session_plan.system_prompt_text,
+            model=request.model,
         )
         parsed = _sanitize_parsed_output(parse_cli_output(result.stdout), allowed_tool_names)
         session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
@@ -647,11 +793,17 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     @app.post("/v1/responses")
     def responses(body: dict[str, Any]) -> Any:
         try:
-            prompt, allowed_tool_names, _normalized_tools = _responses_prompt_from_body(body)
+            prompt, allowed_tool_names, normalized_tools = _responses_prompt_from_body(body)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": {"message": exc.detail, "type": "invalid_request_error"}})
 
         model = str(body.get("model") or (cfg.models[0] if cfg.models else "cli-http-shim"))
+        _log_responses_request_summary(
+            body=body,
+            messages=_normalize_responses_input(body.get("input")),
+            normalized_tools=normalized_tools,
+            prompt=prompt,
+        )
         if body.get("stream"):
             return StreamingResponse(
                 _stream_live_responses_events(model=model, prompt=prompt, config=cfg, allowed_tool_names=allowed_tool_names),
@@ -661,7 +813,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                     "X-Accel-Buffering": "no",
                 },
             )
-        result = run_cli_prompt(prompt, cfg)
+        result = run_cli_prompt(prompt, cfg, model=model)
         ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
         parsed = _parsed_output_from_events(ordered_events)
         return _responses_json_response(model=model, parsed=parsed, output_items=_responses_output_items_from_events(ordered_events))
@@ -677,6 +829,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--model", action="append", dest="models")
+    parser.add_argument("--fallback-model", dest="fallback_model", default=None)
     parser.add_argument("--profile", choices=["auto", "claude", "codex", "opencode", "generic"], default="auto")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
@@ -690,6 +843,7 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "cwd": config.cwd,
         "timeout": config.timeout,
         "models": list(config.models),
+        "fallback_model": config.fallback_model,
         "provider_label": config.provider_label,
         "cli_profile": config.cli_profile,
         "provided_args": list(config.args),
@@ -708,8 +862,9 @@ def main() -> None:
         args=args,
         cwd=ns.cwd,
         timeout=ns.timeout,
-        models=ns.models or ["claude-cli"],
+        models=ns.models or ["sonnet", "opus", "haiku"],
         cli_profile=ns.profile,
+        fallback_model=ns.fallback_model,
     )
     import uvicorn
 
