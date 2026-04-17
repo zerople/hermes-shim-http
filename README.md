@@ -68,20 +68,36 @@ Before you start, make sure you have:
 
 ### 1) Run it with `npx`
 
+> **Important:** `--cwd` must be a **real, existing directory**. Do not copy `/path/to/project` literally — it is only a placeholder. If the path does not exist, the wrapped CLI subprocess will fail with `FileNotFoundError: [Errno 2] No such file or directory`.
+
+The safest way is to `cd` into your project first and use `"$(pwd)"`:
+
+```bash
+cd /home/me/my-project    # your real project path
+npx @zerople/hermes-shim-http \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --command claude \
+  --cwd "$(pwd)" \
+  --model claude-cli
+```
+
+Or pass an explicit absolute path you know exists:
+
 ```bash
 npx @zerople/hermes-shim-http \
   --host 127.0.0.1 \
   --port 8765 \
   --command claude \
-  --cwd /path/to/project \
+  --cwd /home/me/my-project \
   --model claude-cli
 ```
 
-If you prefer Codex or OpenCode:
+If you prefer Codex or OpenCode, the same rule applies — replace `"$(pwd)"` or the absolute path with your own project location:
 
 ```bash
-npx @zerople/hermes-shim-http --command codex --cwd /path/to/project --model codex-cli
-npx @zerople/hermes-shim-http --command opencode --cwd /path/to/project --model opencode-cli
+npx @zerople/hermes-shim-http --command codex    --cwd "$(pwd)" --model codex-cli
+npx @zerople/hermes-shim-http --command opencode --cwd "$(pwd)" --model opencode-cli
 ```
 
 ### 2) Confirm the server is up
@@ -108,14 +124,15 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 ## Recommended usage with Hermes Agent
 
-Start the shim:
+Start the shim (use your real project path, not the example below):
 
 ```bash
+cd /home/me/hermes-agent    # your real project path
 npx @zerople/hermes-shim-http \
   --host 127.0.0.1 \
   --port 8765 \
   --command claude \
-  --cwd /tmp/hermes-agent \
+  --cwd "$(pwd)" \
   --model claude-cli
 ```
 
@@ -358,9 +375,26 @@ codex --help
 opencode --help
 ```
 
+### `FileNotFoundError: [Errno 2] No such file or directory: '/path/to/project'`
+
+This means you passed a `--cwd` value that does not exist on your machine. The `/path/to/project` string in the docs is **only a placeholder** — you must replace it with a real, existing directory.
+
+Fix it by either:
+
+- `cd` into your real project and use `--cwd "$(pwd)"`, or
+- pass an absolute path you know exists, e.g. `--cwd /home/me/my-project`
+
+You can confirm the path exists before launching:
+
+```bash
+ls -ld /home/me/my-project
+```
+
 ### The shim starts but the CLI behaves oddly
 
 Check the `--cwd` value first. Many tool-use and file-access issues happen because the wrapped CLI is running in the wrong working directory.
+
+Note that `--cwd` only sets the working directory for the **wrapped CLI subprocess**. It does not change the working directory of the client that consumes the shim's responses. If the model emits tool calls with relative paths, the consuming client may resolve them against a different directory. Prefer absolute paths in tool-call arguments when possible.
 
 ### First run is slow
 
