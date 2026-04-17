@@ -1,0 +1,50 @@
+{
+  "name": "@zerople/hermes-shim-http",
+  "version": "0.1.0",
+  "description": "Run Claude, Codex, or OpenCode as a local OpenAI-compatible HTTP provider for Hermes and other clients.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "hermes-shim-http": "bin/hermes-shim-http.js"
+  },
+  "files": [
+    "bin/",
+    "hermes_shim_http/",
+    "requirements.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "prepack": "find hermes_shim_http -type d -name __pycache__ -prune -exec rm -rf {} + || true",
+    "test": "python3 -m pytest -q",
+    "smoke": "python3 -m pytest -q tests/test_cli_http_shim_server.py -k responses"
+  },
+  "keywords": [
+    "hermes",
+    "agent",
+    "llm",
+    "openai",
+    "openai-compatible",
+    "http-server",
+    "local-ai",
+    "shim",
+    "claude",
+    "codex",
+    "opencode",
+    "fastapi"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zerople/hermes-shim-http.git"
+  },
+  "homepage": "https://github.com/zerople/hermes-shim-http#readme",
+  "bugs": {
+    "url": "https://github.com/zerople/hermes-shim-http/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

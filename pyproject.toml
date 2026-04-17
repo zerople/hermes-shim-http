@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-shim-http"
+version = "0.1.0"
+description = "OpenAI-compatible HTTP shim for local coding CLIs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi==0.136.0",
+  "uvicorn==0.44.0",
+  "pydantic==2.13.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

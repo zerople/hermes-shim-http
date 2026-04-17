@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+tests/
+.github/
+requirements-dev.txt
+pyproject.toml
+*.tgz

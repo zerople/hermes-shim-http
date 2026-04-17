@@ -1,0 +1,130 @@
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hermes_shim_http.models import CliRunResult, ShimConfig
+from hermes_shim_http.prompting import build_cli_prompt
+from hermes_shim_http.runner import build_cli_command, run_cli_prompt, stream_cli_prompt
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FAKE_CLI = REPO_ROOT / "tests" / "fake_cli.py"
+
+
+class TestPrompting:
+    def test_build_cli_prompt_includes_transcript_tools_and_native_tool_ban(self):
+        prompt = build_cli_prompt(
+            messages=[
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Check the repo."},
+                {"role": "tool", "content": "{\"ok\": true}"},
+            ],
+            model="claude-cli",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        assert "Hermes requested model hint: claude-cli" in prompt
+        assert "Do NOT use any native CLI built-in tools" in prompt
+        assert "<tool_call>{...}</tool_call>" in prompt
+        assert "read_file" in prompt
+        assert "System:\nYou are helpful." in prompt
+        assert "User:\nCheck the repo." in prompt
+        assert "Tool:\n{\"ok\": true}" in prompt
+
+
+class TestRunner:
+    def test_build_cli_command_combines_command_args_and_prompt(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello")
+
+        assert cmd == ["claude", "-p", "hello"]
+
+    def test_build_cli_command_uses_profile_defaults_for_supported_clis(self):
+        assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == ["claude", "-p", "hello"]
+        assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
+        assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
+
+    def test_run_cli_prompt_returns_result(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        completed = subprocess.CompletedProcess(
+            args=["claude", "-p", "hello"],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+
+        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed) as mock_run:
+            result = run_cli_prompt("hello", cfg)
+
+        assert isinstance(result, CliRunResult)
+        assert result.stdout == "done"
+        assert result.stderr == ""
+        assert result.exit_code == 0
+        mock_run.assert_called_once()
+
+    def test_run_cli_prompt_raises_on_non_zero_exit(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        completed = subprocess.CompletedProcess(
+            args=["claude", "-p", "hello"],
+            returncode=1,
+            stdout="",
+            stderr="boom",
+        )
+
+        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed):
+            with pytest.raises(RuntimeError, match="boom"):
+                run_cli_prompt("hello", cfg)
+
+    def test_run_cli_prompt_raises_timeout_error(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+
+        with patch(
+            "hermes_shim_http.runner.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=12.0),
+        ):
+            with pytest.raises(TimeoutError, match="Timed out"):
+                run_cli_prompt("hello", cfg)
+
+    def test_stream_cli_prompt_yields_text_chunks_live(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "stream-text"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+        )
+
+        events = list(stream_cli_prompt("ignored", cfg))
+
+        assert events
+        assert all(event.kind == "text" for event in events)
+        assert "".join(event.text or "" for event in events) == "Streaming hello from fake CLI\n"
+
+    def test_stream_cli_prompt_yields_tool_call_event_without_wrapper_text(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "stream-tool"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+        )
+
+        events = list(stream_cli_prompt("ignored", cfg))
+
+        tool_call_events = [event for event in events if event.kind == "tool_call"]
+        text_payload = "".join(event.text or "" for event in events if event.kind == "text")
+
+        assert len(tool_call_events) == 1
+        assert text_payload == ""
+        assert tool_call_events[0].tool_call["function"]["name"] == "read_file"
