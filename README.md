@@ -73,7 +73,7 @@ Before you start, make sure you have:
 The safest way is to `cd` into your project first and use `"$(pwd)"`:
 
 ```bash
-cd /home/me/my-project    # your real project path
+cd /ABSOLUTE/PATH/TO/YOUR/PROJECT    # replace with your real project path
 npx @zerople/hermes-shim-http \
   --host 127.0.0.1 \
   --port 8765 \
@@ -82,14 +82,14 @@ npx @zerople/hermes-shim-http \
   --model claude-cli
 ```
 
-Or pass an explicit absolute path you know exists:
+Or pass an explicit absolute path you know exists. **Replace `/ABSOLUTE/PATH/TO/YOUR/PROJECT` with your own real project directory** — do not copy it literally:
 
 ```bash
 npx @zerople/hermes-shim-http \
   --host 127.0.0.1 \
   --port 8765 \
   --command claude \
-  --cwd /home/me/my-project \
+  --cwd /ABSOLUTE/PATH/TO/YOUR/PROJECT \
   --model claude-cli
 ```
 
@@ -127,7 +127,7 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 Start the shim (use your real project path, not the example below):
 
 ```bash
-cd /home/me/hermes-agent    # your real project path
+cd /ABSOLUTE/PATH/TO/YOUR/PROJECT    # replace with your real project path
 npx @zerople/hermes-shim-http \
   --host 127.0.0.1 \
   --port 8765 \
@@ -382,12 +382,12 @@ This means you passed a `--cwd` value that does not exist on your machine. The `
 Fix it by either:
 
 - `cd` into your real project and use `--cwd "$(pwd)"`, or
-- pass an absolute path you know exists, e.g. `--cwd /home/me/my-project`
+- pass an absolute path you know exists, e.g. `--cwd /ABSOLUTE/PATH/TO/YOUR/PROJECT` (replace with your actual directory)
 
 You can confirm the path exists before launching:
 
 ```bash
-ls -ld /home/me/my-project
+ls -ld /ABSOLUTE/PATH/TO/YOUR/PROJECT
 ```
 
 ### The shim starts but the CLI behaves oddly
