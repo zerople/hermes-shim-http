@@ -14,9 +14,12 @@ This package gives you a local provider endpoint that looks like OpenAI-compatib
 
 - run locally with `npx @zerople/hermes-shim-http ...`
 - supports `claude`, `codex`, and `opencode`
-- exposes `chat/completions`, `responses`, and `models` endpoints
+- exposes `chat/completions`, `responses`, `models`, and debug observability endpoints
 - bootstraps its Python runtime automatically on first run
 - keeps Hermes as the real tool executor when used as a Hermes provider
+- supports optional persistent session caching when `--cache-path` is set
+- reports fallback token/context estimates and supports context compaction controls
+- emits structured logs and SSE keepalive pings for long streams
 
 ---
 
@@ -121,6 +124,8 @@ This prints a short preflight summary covering:
 ```bash
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/v1/models
+curl http://127.0.0.1:8765/v1/debug/stats
+curl http://127.0.0.1:8765/v1/debug/quota
 ```
 
 ### 4) Send a test request
@@ -135,6 +140,31 @@ curl http://127.0.0.1:8765/v1/chat/completions \
     ]
   }'
 ```
+
+## Observability and control flags
+
+Useful runtime flags added in `0.1.6`:
+
+```bash
+npx @zerople/hermes-shim-http \
+  --cache-path ~/.cache/hermes-shim-http/sessions.sqlite \
+  --cache-ttl-seconds 3600 \
+  --cache-max-entries 256 \
+  --compaction window \
+  --compaction-threshold 0.9 \
+  --log-level info \
+  --log-format text
+```
+
+Notes:
+
+- Persistent SQLite session caching is **opt-in**; omit `--cache-path` to keep cache state in memory only.
+
+- `GET /v1/debug/stats` exposes cache, latency, uptime, and token/context aggregates.
+- `GET /v1/debug/quota` returns `{ "status": "unknown" }` until the wrapped CLI exposes real quota data.
+- chat/responses usage objects include fallback `context_tokens_used`, `context_tokens_limit`, and `response_tokens` estimates.
+- slash commands `/clear`, `/compact`, `/model <name>`, and `/stats` are handled as normal assistant responses.
+- long SSE streams emit `: ping` comments during idle periods to avoid proxy/client timeouts.
 
 ---
 

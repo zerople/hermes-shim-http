@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from hermes_shim_http.models import CliRunResult, ShimConfig
 from hermes_shim_http.prompting import build_cli_prompt
@@ -46,6 +47,52 @@ class TestPrompting:
 
 
 class TestRunner:
+    def test_shim_config_accepts_observability_and_cache_fields(self):
+        cfg = ShimConfig(
+            command="claude",
+            cache_path="/tmp/sessions.sqlite",
+            cache_ttl_seconds=120.0,
+            cache_max_entries=99,
+            compaction="window",
+            compaction_threshold=0.8,
+            log_level="debug",
+            log_format="json",
+        )
+
+        assert cfg.cache_path == "/tmp/sessions.sqlite"
+        assert cfg.cache_ttl_seconds == 120.0
+        assert cfg.cache_max_entries == 99
+        assert cfg.compaction == "window"
+        assert cfg.compaction_threshold == 0.8
+        assert cfg.log_level == "debug"
+        assert cfg.log_format == "json"
+
+    def test_shim_config_disables_persistent_cache_by_default(self):
+        cfg = ShimConfig(command="claude")
+
+        assert cfg.cache_path is None
+
+    def test_shim_config_rejects_invalid_compaction_mode(self):
+        with pytest.raises(ValidationError):
+            ShimConfig(command="claude", compaction="invalid")
+
+    def test_chat_message_preserves_tool_calls_in_model_dump(self):
+        from hermes_shim_http.models import ChatMessage
+
+        message = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                }
+            ],
+        )
+
+        assert message.model_dump()["tool_calls"][0]["function"]["name"] == "read_file"
+
     def test_build_cli_command_keeps_claude_prompt_off_argv(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work")
 
