@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from hermes_shim_http import __version__
 from hermes_shim_http.models import CliRunResult, CliStreamEvent, ShimConfig
 from hermes_shim_http.server import create_app
 
@@ -72,7 +73,7 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/api/tags").json()["models"][0]["name"] == "claude-cli"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
-    assert client.get("/version").json()["version"] == "0.1.4"
+    assert client.get("/version").json()["version"] == __version__
 
 
 def test_chat_completions_returns_plain_text():
