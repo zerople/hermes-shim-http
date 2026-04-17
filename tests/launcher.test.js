@@ -77,6 +77,7 @@ test('doctor summary reports missing venv support clearly', () => {
     cwd: '/repo',
     existsSyncImpl: (value) => value === '/repo',
     statSyncImpl: () => ({ isDirectory: () => true }),
+    commandExistsImpl: () => true,
     resolveCliArgsImpl: () => ['-p'],
   });
 
