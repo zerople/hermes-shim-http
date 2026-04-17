@@ -51,8 +51,18 @@ def resolved_cli_args(config: ShimConfig) -> list[str]:
     return _resolved_args(config)
 
 
-def build_cli_command(config: ShimConfig, prompt_text: str) -> List[str]:
+def build_cli_command(
+    config: ShimConfig,
+    prompt_text: str,
+    *,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
+) -> List[str]:
     command = [config.command, *_resolved_args(config)]
+    if _pipes_prompt_via_stdin(config) and session_id:
+        if resume_session_id:
+            command.extend(["--resume", resume_session_id, "--fork-session"])
+        command.extend(["--session-id", session_id])
     if _pipes_prompt_via_stdin(config):
         return command
     return [*command, prompt_text]
@@ -67,8 +77,14 @@ def _translate_spawn_oserror(exc: OSError, *, command: str) -> RuntimeError:
     return RuntimeError(f"Failed to start CLI process '{command}': {exc}")
 
 
-def run_cli_prompt(prompt_text: str, config: ShimConfig) -> CliRunResult:
-    command = build_cli_command(config, prompt_text)
+def run_cli_prompt(
+    prompt_text: str,
+    config: ShimConfig,
+    *,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
+) -> CliRunResult:
+    command = build_cli_command(config, prompt_text, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
     run_kwargs = {
         "cwd": config.cwd,
@@ -117,8 +133,14 @@ def _pump_stream(stream, sink: queue.Queue[tuple[str, str] | None], stream_name:
         sink.put(None)
 
 
-def stream_cli_prompt(prompt_text: str, config: ShimConfig) -> Iterator[CliStreamEvent]:
-    command = build_cli_command(config, prompt_text)
+def stream_cli_prompt(
+    prompt_text: str,
+    config: ShimConfig,
+    *,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
+) -> Iterator[CliStreamEvent]:
+    command = build_cli_command(config, prompt_text, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
     popen_kwargs = {
         "cwd": config.cwd,

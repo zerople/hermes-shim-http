@@ -72,7 +72,7 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/api/tags").json()["models"][0]["name"] == "claude-cli"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
-    assert client.get("/version").json()["version"] == "0.1.3"
+    assert client.get("/version").json()["version"] == "0.1.4"
 
 
 def test_chat_completions_returns_plain_text():
@@ -81,7 +81,7 @@ def test_chat_completions_returns_plain_text():
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(stdout="Hello from Claude", stderr="", exit_code=0, duration_ms=10),
-    ):
+    ) as mock_run:
         response = client.post(
             "/v1/chat/completions",
             json={
@@ -94,6 +94,8 @@ def test_chat_completions_returns_plain_text():
     payload = response.json()
     assert payload["choices"][0]["message"]["content"] == "Hello from Claude"
     assert payload["choices"][0]["finish_reason"] == "stop"
+    assert mock_run.call_args.kwargs["session_id"]
+    assert mock_run.call_args.kwargs["resume_session_id"] is None
 
 
 def test_chat_completions_returns_tool_calls():
@@ -130,6 +132,39 @@ def test_chat_completions_returns_tool_calls():
     payload = response.json()
     assert payload["choices"][0]["finish_reason"] == "tool_calls"
     assert payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+def test_chat_completions_reuses_prefix_matched_session_on_followup_request():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="ok", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-cli",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-cli",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    first_call = mock_run.call_args_list[0].kwargs
+    second_call = mock_run.call_args_list[1].kwargs
+    assert second_call["resume_session_id"] == first_call["session_id"]
+    assert second_call["session_id"] != first_call["session_id"]
 
 
 def test_chat_completions_rejects_tool_calls_not_advertised_in_request():

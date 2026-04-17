@@ -15,6 +15,7 @@ from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, Sh
 from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt
 from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt
+from .session_cache import SessionCache, SessionPlan
 
 
 def _chat_response(*, model: str, parsed: ParsedShimOutput) -> dict[str, Any]:
@@ -43,6 +44,10 @@ def _chat_response(*, model: str, parsed: ParsedShimOutput) -> dict[str, Any]:
             "total_tokens": 0,
         },
     }
+
+
+def _assistant_messages_from_parsed(parsed: ParsedShimOutput) -> list[dict[str, Any]]:
+    return [{"role": "assistant", "content": parsed.content}]
 
 
 def _normalize_chat_tools(raw_tools: Any, *, strict: bool = False) -> list[dict[str, Any]] | None:
@@ -173,12 +178,22 @@ def _flush_pending_chat_text(*, completion_id: str, created: int, model: str, pe
     )
 
 
-def _stream_live_chat_chunks(*, model: str, prompt: str, config: ShimConfig, allowed_tool_names: set[str] | None) -> Iterator[bytes]:
+def _stream_live_chat_chunks(
+    *,
+    model: str,
+    prompt: str,
+    config: ShimConfig,
+    allowed_tool_names: set[str] | None,
+    session_plan: SessionPlan,
+    session_cache: SessionCache,
+) -> Iterator[bytes]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     saw_tool_calls = False
     tool_index = 0
     pending_text = ""
+    completed_tool_calls: list[dict[str, Any]] = []
+    assistant_text_chunks: list[str] = []
 
     yield _sse_line(
         {
@@ -190,7 +205,12 @@ def _stream_live_chat_chunks(*, model: str, prompt: str, config: ShimConfig, all
         }
     )
 
-    for event in stream_cli_prompt(prompt, config):
+    for event in stream_cli_prompt(
+        prompt,
+        config,
+        session_id=session_plan.session_id,
+        resume_session_id=session_plan.resume_session_id,
+    ):
         if event.kind == "tool_call" and event.tool_call:
             name = str(event.tool_call.get("function", {}).get("name") or "").strip()
             if allowed_tool_names is not None and name not in allowed_tool_names:
@@ -204,6 +224,7 @@ def _stream_live_chat_chunks(*, model: str, prompt: str, config: ShimConfig, all
             )
             pending_text = ""
             saw_tool_calls = True
+            completed_tool_calls.append(event.tool_call)
             yield _sse_line(
                 _stream_chunk_for_tool_call(
                     completion_id=completion_id,
@@ -216,6 +237,7 @@ def _stream_live_chat_chunks(*, model: str, prompt: str, config: ShimConfig, all
             tool_index += 1
         elif event.kind == "text" and event.text:
             pending_text += event.text
+            assistant_text_chunks.append(event.text)
             if "\n" in pending_text or len(pending_text) >= 24 or (event.text[-1:].isspace() and len(pending_text) >= 8):
                 yield from _flush_pending_chat_text(
                     completion_id=completion_id,
@@ -230,6 +252,17 @@ def _stream_live_chat_chunks(*, model: str, prompt: str, config: ShimConfig, all
         created=created,
         model=model,
         pending_text=pending_text,
+    )
+
+    session_cache.record_success(
+        session_plan,
+        assistant_messages=[
+            {
+                "role": "assistant",
+                "content": "".join(assistant_text_chunks),
+                **({"tool_calls": completed_tool_calls} if completed_tool_calls else {}),
+            }
+        ],
     )
 
     yield _sse_line(
@@ -504,6 +537,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     cfg = config or ShimConfig(command="claude")
     app = FastAPI(title="Hermes CLI HTTP Shim", version=__version__)
     app.state.shim_config = cfg
+    app.state.session_cache = SessionCache()
 
     def _model_payload(model: str) -> dict[str, Any]:
         return {
@@ -574,24 +608,40 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionsRequest) -> Any:
-        prompt = build_cli_prompt(
-            messages=[message.model_dump() for message in request.messages],
+        request_messages = [message.model_dump() for message in request.messages]
+        request_tools = [tool.model_dump() for tool in request.tools] if request.tools else None
+        session_cache: SessionCache = app.state.session_cache
+        session_plan = session_cache.plan_request(
+            messages=request_messages,
             model=request.model,
-            tools=[tool.model_dump() for tool in request.tools] if request.tools else None,
+            tools=request_tools,
             tool_choice=request.tool_choice,
         )
-        allowed_tool_names = _allowed_tool_names_from_tools([tool.model_dump() for tool in request.tools] if request.tools else None)
+        allowed_tool_names = _allowed_tool_names_from_tools(request_tools)
         if request.stream:
             return StreamingResponse(
-                _stream_live_chat_chunks(model=request.model, prompt=prompt, config=cfg, allowed_tool_names=allowed_tool_names),
+                _stream_live_chat_chunks(
+                    model=request.model,
+                    prompt=session_plan.prompt_text,
+                    config=cfg,
+                    allowed_tool_names=allowed_tool_names,
+                    session_plan=session_plan,
+                    session_cache=session_cache,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        result = run_cli_prompt(prompt, cfg)
+        result = run_cli_prompt(
+            session_plan.prompt_text,
+            cfg,
+            session_id=session_plan.session_id,
+            resume_session_id=session_plan.resume_session_id,
+        )
         parsed = _sanitize_parsed_output(parse_cli_output(result.stdout), allowed_tool_names)
+        session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
         return _chat_response(model=request.model, parsed=parsed)
 
     @app.post("/v1/responses")

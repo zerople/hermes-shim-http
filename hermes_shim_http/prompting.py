@@ -43,6 +43,27 @@ def _render_tools(tools: Iterable[ToolDefinition] | None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _render_transcript(messages: list[dict[str, Any]] | list[Any]) -> list[str]:
+    transcript: list[str] = []
+    for raw in messages:
+        message = raw if isinstance(raw, dict) else raw.model_dump()
+        role = str(message.get("role") or "context").strip().lower()
+        label = {
+            "system": "System",
+            "user": "User",
+            "assistant": "Assistant",
+            "tool": "Tool",
+        }.get(role, "Context")
+        rendered = _render_content(message.get("content"))
+        if rendered:
+            transcript.append(f"{label}:\n{rendered}")
+    return transcript
+
+
+def build_cli_resume_delta_prompt(*, messages: list[dict[str, Any]] | list[Any]) -> str:
+    return "\n\n".join(_render_transcript(messages)).strip()
+
+
 def build_cli_prompt(*, messages: list[dict[str, Any]] | list[Any], model: str, tools: list[dict[str, Any]] | list[ToolDefinition] | None, tool_choice: Any = None) -> str:
     sections = [
         "You are being used as a local HTTP shim backend for Hermes Agent.",
@@ -66,20 +87,7 @@ def build_cli_prompt(*, messages: list[dict[str, Any]] | list[Any], model: str, 
     if tool_choice is not None:
         sections.append("Tool choice hint: " + json.dumps(tool_choice, ensure_ascii=False))
 
-    transcript: list[str] = []
-    for raw in messages:
-        message = raw if isinstance(raw, dict) else raw.model_dump()
-        role = str(message.get("role") or "context").strip().lower()
-        label = {
-            "system": "System",
-            "user": "User",
-            "assistant": "Assistant",
-            "tool": "Tool",
-        }.get(role, "Context")
-        rendered = _render_content(message.get("content"))
-        if rendered:
-            transcript.append(f"{label}:\n{rendered}")
-
+    transcript = _render_transcript(messages)
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
 

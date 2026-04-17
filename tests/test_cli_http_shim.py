@@ -7,6 +7,7 @@ import pytest
 from hermes_shim_http.models import CliRunResult, ShimConfig
 from hermes_shim_http.prompting import build_cli_prompt
 from hermes_shim_http.runner import build_cli_command, run_cli_prompt, stream_cli_prompt
+from hermes_shim_http.session_cache import SessionCache
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,26 @@ class TestRunner:
         assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == ["claude", "-p"]
         assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
         assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
+
+    def test_build_cli_command_includes_claude_session_resume_flags(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(
+            cfg,
+            "hello",
+            session_id="11111111-1111-1111-1111-111111111111",
+            resume_session_id="22222222-2222-2222-2222-222222222222",
+        )
+
+        assert cmd == [
+            "claude",
+            "-p",
+            "--resume",
+            "22222222-2222-2222-2222-222222222222",
+            "--fork-session",
+            "--session-id",
+            "11111111-1111-1111-1111-111111111111",
+        ]
 
     def test_run_cli_prompt_returns_result(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
@@ -195,3 +216,29 @@ class TestRunner:
         assert len(tool_call_events) == 1
         assert text_payload == ""
         assert tool_call_events[0].tool_call["function"]["name"] == "read_file"
+
+
+class TestSessionCache:
+    def test_plan_request_reuses_longest_matching_prefix_via_resume(self):
+        cache = SessionCache()
+        first = cache.plan_request(
+            messages=[{"role": "user", "content": "hello"}],
+            model="claude-cli",
+            tools=None,
+            tool_choice=None,
+        )
+        cache.record_success(first, assistant_messages=[{"role": "assistant", "content": "hi"}])
+        second = cache.plan_request(
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "continue"},
+            ],
+            model="claude-cli",
+            tools=None,
+            tool_choice=None,
+        )
+
+        assert second.resume_session_id == first.session_id
+        assert second.prompt_text == "User:\ncontinue"
+        assert second.prefix_message_count == 2
