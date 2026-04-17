@@ -35,6 +35,7 @@ class ChatCompletionsRequest(BaseModel):
 class ParsedShimOutput(BaseModel):
     content: str = ""
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    silent: bool = False
 
 
 class CliRunResult(BaseModel):

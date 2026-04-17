@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .models import CliStreamEvent, ParsedShimOutput
+from .silence import detect_and_strip as _detect_silent
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_OPEN = "<tool_call>"
@@ -128,7 +129,8 @@ def parse_cli_output(text: str) -> ParsedShimOutput:
         consumed_spans.append((match.start(), match.end()))
 
     if not consumed_spans:
-        return ParsedShimOutput(content=text.strip(), tool_calls=[])
+        cleaned, silent = _detect_silent(text.strip(), has_tool_calls=False)
+        return ParsedShimOutput(content="" if silent else cleaned, tool_calls=[], silent=silent)
 
     consumed_spans.sort()
     merged: list[tuple[int, int]] = []
@@ -148,4 +150,5 @@ def parse_cli_output(text: str) -> ParsedShimOutput:
         parts.append(text[cursor:])
 
     cleaned = "\n".join(part.strip() for part in parts if part and part.strip()).strip()
-    return ParsedShimOutput(content=cleaned, tool_calls=tool_calls)
+    cleaned, silent = _detect_silent(cleaned, has_tool_calls=bool(tool_calls))
+    return ParsedShimOutput(content="" if silent else cleaned, tool_calls=tool_calls, silent=silent)

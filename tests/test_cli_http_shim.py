@@ -37,6 +37,20 @@ class TestPrompting:
         assert "User:" not in system_prompt
         assert "System:" not in system_prompt
 
+    def test_build_cli_system_prompt_documents_default_silence_sentinel(self):
+        system_prompt = build_cli_system_prompt(tools=None)
+
+        assert "<silent/>" in system_prompt
+        assert "silent ACK" in system_prompt
+
+    def test_build_cli_system_prompt_uses_configured_silence_sentinel(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SHIM_SILENT_SENTINEL", "<<<HUSH>>>")
+
+        system_prompt = build_cli_system_prompt(tools=None)
+
+        assert "<<<HUSH>>>" in system_prompt
+        assert "<silent/>" not in system_prompt
+
     def test_build_cli_system_prompt_compacts_verbose_tool_schemas(self):
         system_prompt = build_cli_system_prompt(
             tools=[

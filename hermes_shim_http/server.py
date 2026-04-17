@@ -21,9 +21,12 @@ from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt, compact_messages
 from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
+from .silence import detect_and_strip as _detect_silent
 from .slash_commands import dispatch_slash_command
 from .telemetry import emit_event
 from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_token_usage
+
+SILENT_HEADER = "X-Shim-Silent"
 
 KEEPALIVE_INTERVAL_SECONDS = 10.0
 
@@ -46,14 +49,23 @@ def _chat_response(*, model: str, parsed: ParsedShimOutput, usage: TokenUsageEst
     message: dict[str, Any] = {"role": "assistant", "content": parsed.content}
     if parsed.tool_calls:
         message["tool_calls"] = parsed.tool_calls
+    choice: dict[str, Any] = {"index": 0, "message": message, "finish_reason": finish_reason}
+    if parsed.silent:
+        choice["silent"] = True
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "choices": [choice],
         "usage": _usage_dict(usage),
     }
+
+
+def _silent_headers(parsed: ParsedShimOutput, headers: dict[str, str]) -> dict[str, str]:
+    if parsed.silent:
+        return {**headers, SILENT_HEADER: "true"}
+    return headers
 
 
 def _assistant_messages_from_parsed(parsed: ParsedShimOutput) -> list[dict[str, Any]]:
@@ -124,12 +136,12 @@ def _sanitize_parsed_output(parsed: ParsedShimOutput, allowed_tool_names: set[st
             unsupported_names.append(name)
 
     if not unsupported_names:
-        return ParsedShimOutput(content=parsed.content, tool_calls=allowed_calls)
+        return ParsedShimOutput(content=parsed.content, tool_calls=allowed_calls, silent=parsed.silent)
 
     content = parsed.content.strip()
     if not content:
         content = _unsupported_tool_message(unsupported_names)
-    return ParsedShimOutput(content=content, tool_calls=allowed_calls)
+    return ParsedShimOutput(content=content, tool_calls=allowed_calls, silent=parsed.silent and not content)
 
 
 def _sse_line(payload: dict[str, Any] | str) -> bytes:
@@ -460,14 +472,18 @@ def _responses_output_items_from_events(events: list[CliStreamEvent]) -> list[di
 
 
 def _parsed_output_from_events(events: list[CliStreamEvent]) -> ParsedShimOutput:
+    tool_calls = [event.tool_call for event in events if event.kind == "tool_call" and event.tool_call]
+    content = "".join(event.text or "" for event in events if event.kind == "text").strip()
+    cleaned, silent = _detect_silent(content, has_tool_calls=bool(tool_calls))
     return ParsedShimOutput(
-        content="".join(event.text or "" for event in events if event.kind == "text").strip(),
-        tool_calls=[event.tool_call for event in events if event.kind == "tool_call" and event.tool_call],
+        content="" if silent else cleaned,
+        tool_calls=tool_calls,
+        silent=silent,
     )
 
 
 def _responses_json_response(*, model: str, parsed: ParsedShimOutput, usage: TokenUsageEstimate, output_items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "id": f"resp_{uuid.uuid4().hex[:28]}",
         "object": "response",
         "created_at": int(time.time()),
@@ -483,6 +499,9 @@ def _responses_json_response(*, model: str, parsed: ParsedShimOutput, usage: Tok
             "response_tokens": usage.response_tokens,
         },
     }
+    if parsed.silent:
+        payload["silent"] = True
+    return payload
 
 
 def _normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
@@ -594,11 +613,17 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
                     pending_text = ""
 
         yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
-        parsed = ParsedShimOutput(content="".join(assistant_text_chunks), tool_calls=completed_tool_calls)
+        accumulated_text = "".join(assistant_text_chunks)
+        cleaned_text, silent = _detect_silent(accumulated_text.strip(), has_tool_calls=bool(completed_tool_calls))
+        parsed = ParsedShimOutput(content="" if silent else cleaned_text, tool_calls=completed_tool_calls, silent=silent)
         session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
         usage = estimate_token_usage(messages=request_messages, response_text=parsed.content)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
-        yield _sse_line({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if saw_tool_calls else "stop"}], "usage": _usage_dict(usage)})
+        final_choice: dict[str, Any] = {"index": 0, "delta": {}, "finish_reason": "tool_calls" if saw_tool_calls else "stop"}
+        if silent:
+            final_choice["silent"] = True
+            emit_log(logger, event="silent", request_id=request_id, model=model)
+        yield _sse_line({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [final_choice], "usage": _usage_dict(usage)})
         yield _sse_line("[DONE]")
         emit_log(logger, event="stream_end", request_id=request_id, model=model)
     except Exception as exc:
@@ -673,9 +698,15 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
             for content in item.get("content", [])
             if isinstance(content, dict) and isinstance(content.get("text"), str)
         )
-        usage = estimate_token_usage(messages=request_messages, response_text=response_text)
+        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
+        cleaned_text, silent = _detect_silent(response_text.strip(), has_tool_calls=has_tool_calls)
+        usage = estimate_token_usage(messages=request_messages, response_text="" if silent else cleaned_text)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=False, usage=usage, compacted=compacted)
-        completed_response = {"id": response_id, "object": "response", "created_at": created_at, "status": "completed", "model": model, "output": output_items, "usage": {"input_tokens": usage.context_tokens_used, "output_tokens": usage.response_tokens, "total_tokens": usage.context_tokens_used + usage.response_tokens, "context_tokens_used": usage.context_tokens_used, "context_tokens_limit": usage.context_tokens_limit, "response_tokens": usage.response_tokens}}
+        completed_output_items = [item for item in output_items if item.get("type") != "message"] if silent else output_items
+        completed_response: dict[str, Any] = {"id": response_id, "object": "response", "created_at": created_at, "status": "completed", "model": model, "output": completed_output_items, "usage": {"input_tokens": usage.context_tokens_used, "output_tokens": usage.response_tokens, "total_tokens": usage.context_tokens_used + usage.response_tokens, "context_tokens_used": usage.context_tokens_used, "context_tokens_limit": usage.context_tokens_limit, "response_tokens": usage.response_tokens}}
+        if silent:
+            completed_response["silent"] = True
+            emit_log(logger, event="silent", request_id=request_id, model=model)
         yield _sse_line({"type": "response.completed", "response": completed_response})
         yield _sse_line("[DONE]")
         emit_log(logger, event="stream_end", request_id=request_id, model=model)
@@ -817,8 +848,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
             usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
             _record_metrics(app, latency_ms=max(result.duration_ms, int((time.time() - started) * 1000)), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
+            if parsed.silent:
+                emit_log(logger, event="silent", request_id=request_id, model=request.model)
             emit_log(logger, event="stream_end", request_id=request_id, model=request.model)
-            return JSONResponse(content=_chat_response(model=request.model, parsed=parsed, usage=usage), headers=headers)
+            return JSONResponse(content=_chat_response(model=request.model, parsed=parsed, usage=usage), headers=_silent_headers(parsed, headers))
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -878,8 +911,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             parsed = _parsed_output_from_events(ordered_events)
             usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
             _record_metrics(app, latency_ms=max(result.duration_ms, int((time.time() - started) * 1000)), cache_hit=False, usage=usage, compacted=compacted)
+            if parsed.silent:
+                emit_log(logger, event="silent", request_id=request_id, model=model)
             emit_log(logger, event="stream_end", request_id=request_id, model=model)
-            return JSONResponse(content=_responses_json_response(model=model, parsed=parsed, usage=usage, output_items=_responses_output_items_from_events(ordered_events)), headers=headers)
+            return JSONResponse(content=_responses_json_response(model=model, parsed=parsed, usage=usage, output_items=_responses_output_items_from_events(ordered_events)), headers=_silent_headers(parsed, headers))
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc

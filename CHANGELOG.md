@@ -2,6 +2,14 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.9] - 2026-04-17
+
+### Added
+- Documented the silence sentinel (`<silent/>`, configurable via `HERMES_SHIM_SILENT_SENTINEL`) in the CLI system prompt so the wrapped reasoning model can intentionally produce a silent ACK turn. Previously the server-side detection existed but the model was never told the protocol, so a model trying to "stay quiet" would emit an empty body and trip the upstream client's empty-response retry loop.
+
+### Notes
+- Behavior is opt-in by the model. Empty replies that do not contain the sentinel are still treated as errors by the upstream client, matching the existing semantics covered in `tests/test_cli_http_shim_server.py`.
+
 ## [0.1.8] - 2026-04-17
 
 ### Fixed

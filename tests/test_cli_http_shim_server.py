@@ -892,3 +892,162 @@ def test_structured_logging_emits_request_ids_and_cache_events(caplog):
     assert any('"event": "cache_miss"' in record.message for record in caplog.records)
     assert any('"event": "spawn"' in record.message for record in caplog.records)
     assert all('"request_id":' in record.message for record in caplog.records if '"event":' in record.message)
+
+
+# ---------------------------------------------------------------------------
+# Silence sentinel (`<silent/>`) — intentional empty-response signaling.
+# An empty response without the sentinel is still treated as an error by the
+# upstream client; only an explicit sentinel marks the turn as silent ACK.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_completions_marks_silent_when_sentinel_is_only_output():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="<silent/>", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "sonnet", "messages": [{"role": "user", "content": "noop"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("X-Shim-Silent") == "true"
+    payload = response.json()
+    assert payload["choices"][0]["silent"] is True
+    assert payload["choices"][0]["message"]["content"] == ""
+    assert payload["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_keeps_content_when_sentinel_is_mixed_with_text():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="hi <silent/>", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "sonnet", "messages": [{"role": "user", "content": "noop"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("X-Shim-Silent") is None
+    payload = response.json()
+    assert "silent" not in payload["choices"][0]
+    assert payload["choices"][0]["message"]["content"] == "hi"
+
+
+def test_chat_completions_streaming_marks_silent_in_final_chunk():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.stream_cli_prompt",
+        return_value=iter([CliStreamEvent(kind="text", text="<silent/>")]),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "sonnet", "messages": [{"role": "user", "content": "noop"}], "stream": True},
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    assert '"silent": true' in body
+    assert '"finish_reason": "stop"' in body
+    assert "data: [DONE]" in body
+
+
+def test_responses_endpoint_marks_silent_when_sentinel_is_only_output():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="<silent/>", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "sonnet", "input": "noop"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("X-Shim-Silent") == "true"
+    payload = response.json()
+    assert payload["silent"] is True
+    assert payload["status"] == "completed"
+
+
+def test_responses_streaming_marks_silent_in_completed_event():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.stream_cli_prompt",
+        return_value=iter([CliStreamEvent(kind="text", text="<silent/>")]),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "sonnet", "input": "noop", "stream": True},
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    assert '"silent": true' in body
+    assert '"response.completed"' in body
+    assert "data: [DONE]" in body
+
+
+def test_chat_completions_silent_flag_emits_silent_log_event(caplog):
+    client = _client_with_config(log_level="debug", log_format="json")
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_shim_http"):
+        with patch(
+            "hermes_shim_http.server.run_cli_prompt",
+            return_value=CliRunResult(stdout="<silent/>", stderr="", exit_code=0, duration_ms=10),
+        ):
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "claude-cli", "messages": [{"role": "user", "content": "noop"}]},
+            )
+
+    assert any('"event": "silent"' in record.message for record in caplog.records)
+
+
+def test_silence_sentinel_is_configurable_via_env(monkeypatch):
+    monkeypatch.setenv("HERMES_SHIM_SILENT_SENTINEL", "<<<HUSH>>>")
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="<<<HUSH>>>", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "sonnet", "messages": [{"role": "user", "content": "noop"}]},
+        )
+
+    assert response.headers.get("X-Shim-Silent") == "true"
+    assert response.json()["choices"][0]["silent"] is True
+
+
+def test_empty_response_without_sentinel_is_not_marked_silent():
+    """An empty CLI response without the sentinel is treated as a normal empty
+    completion (not silent). Upstream clients can decide whether to retry."""
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "sonnet", "messages": [{"role": "user", "content": "noop"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("X-Shim-Silent") is None
+    payload = response.json()
+    assert "silent" not in payload["choices"][0]
+    assert payload["choices"][0]["message"]["content"] == ""
