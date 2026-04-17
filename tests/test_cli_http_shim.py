@@ -264,21 +264,18 @@ class TestRunner:
 
     def test_run_cli_prompt_sends_combined_prompt_via_stdin_for_claude(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
-        completed = subprocess.CompletedProcess(
-            args=["claude", "-p"],
-            returncode=0,
-            stdout="done",
-            stderr="",
-        )
 
-        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed) as mock_run:
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=("done", "", 0),
+        ) as mock_drain:
             result = run_cli_prompt("hello", cfg, system_prompt="Be terse.", model="sonnet")
 
         assert isinstance(result, CliRunResult)
         assert result.stdout == "done"
         assert result.stderr == ""
         assert result.exit_code == 0
-        mock_run.assert_called_once_with(
+        mock_drain.assert_called_once_with(
             [
                 "claude",
                 "-p",
@@ -287,24 +284,17 @@ class TestRunner:
                 "--model",
                 "sonnet",
             ],
-            cwd="/tmp/work",
-            capture_output=True,
-            text=True,
-            input="Be terse.\n\nhello",
-            timeout=12.0,
-            check=False,
+            config=cfg,
+            stdin_prompt="Be terse.\n\nhello",
         )
 
     def test_run_cli_prompt_omits_large_system_prompt_from_resumed_claude_stdin(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
-        completed = subprocess.CompletedProcess(
-            args=["claude", "-p"],
-            returncode=0,
-            stdout="done",
-            stderr="",
-        )
 
-        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed) as mock_run:
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=("done", "", 0),
+        ) as mock_drain:
             run_cli_prompt(
                 "<user>\ncontinue\n</user>",
                 cfg,
@@ -314,7 +304,7 @@ class TestRunner:
                 resume_session_id="22222222-2222-2222-2222-222222222222",
             )
 
-        mock_run.assert_called_once_with(
+        mock_drain.assert_called_once_with(
             [
                 "claude",
                 "-p",
@@ -326,24 +316,17 @@ class TestRunner:
                 "--session-id",
                 "11111111-1111-1111-1111-111111111111",
             ],
-            cwd="/tmp/work",
-            capture_output=True,
-            text=True,
-            input="<user>\ncontinue\n</user>",
-            timeout=12.0,
-            check=False,
+            config=cfg,
+            stdin_prompt="<user>\ncontinue\n</user>",
         )
 
     def test_run_cli_prompt_raises_on_non_zero_exit(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
-        completed = subprocess.CompletedProcess(
-            args=["claude", "-p"],
-            returncode=1,
-            stdout="",
-            stderr="boom",
-        )
 
-        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed):
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=("", "boom", 1),
+        ):
             with pytest.raises(RuntimeError, match="boom"):
                 run_cli_prompt("hello", cfg)
 
@@ -351,17 +334,17 @@ class TestRunner:
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
 
         with patch(
-            "hermes_shim_http.runner.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=12.0),
+            "hermes_shim_http.runner._drain_cli_process",
+            side_effect=TimeoutError("CLI process idle for 12.0s with no stdout/stderr output"),
         ):
-            with pytest.raises(TimeoutError, match="Timed out"):
+            with pytest.raises(TimeoutError, match="idle for"):
                 run_cli_prompt("hello", cfg)
 
     def test_run_cli_prompt_translates_argument_list_too_long_error(self):
         cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)
 
         with patch(
-            "hermes_shim_http.runner.subprocess.run",
+            "hermes_shim_http.runner.subprocess.Popen",
             side_effect=OSError(7, "Argument list too long", "codex"),
         ):
             with pytest.raises(RuntimeError, match="Prompt too large to pass on the command line"):
@@ -512,6 +495,17 @@ class TestRunner:
         assert events
         assert all(event.kind == "text" for event in events)
         assert "".join(event.text or "" for event in events) == "Streaming hello from fake CLI\n"
+
+    def test_stream_cli_prompt_raises_idle_timeout_when_cli_is_silent(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "idle-silent"],
+            cwd=str(REPO_ROOT),
+            timeout=0.3,
+        )
+
+        with pytest.raises(TimeoutError, match="idle for"):
+            list(stream_cli_prompt("ignored", cfg))
 
     def test_stream_cli_prompt_translates_argument_list_too_long_error(self):
         cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)

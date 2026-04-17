@@ -54,7 +54,7 @@ class ShimConfig(BaseModel):
     command: str
     args: List[str] = Field(default_factory=list)
     cwd: str = "."
-    timeout: float = 120.0
+    timeout: float = 300.0
     models: List[str] = Field(default_factory=lambda: ["sonnet", "opus", "haiku"])
     provider_label: str = "cli-http-shim"
     cli_profile: Literal["auto", "claude", "codex", "opencode", "generic"] = "auto"

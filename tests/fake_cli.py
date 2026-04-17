@@ -37,6 +37,10 @@ def main() -> int:
         print(" stream", end="", flush=True)
         return 0
 
+    if args.mode == "idle-silent":
+        time.sleep(5)
+        return 0
+
     if "read_file" in prompt.lower() and "read the readme" in prompt.lower():
         print('<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>')
     elif "say hello" in prompt.lower():

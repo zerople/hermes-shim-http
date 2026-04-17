@@ -168,36 +168,115 @@ def run_cli_prompt(
     stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
     _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
-    run_kwargs = {
-        "cwd": config.cwd,
-        "capture_output": True,
-        "text": True,
-        "timeout": config.timeout,
-        "check": False,
-    }
-    if _pipes_prompt_via_stdin(config):
-        run_kwargs["input"] = stdin_prompt
-    try:
-        completed = subprocess.run(
-            command,
-            **run_kwargs,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"Timed out waiting for CLI process after {config.timeout:.1f}s") from exc
-    except OSError as exc:
-        raise _translate_spawn_oserror(exc, command=config.command) from exc
-
+    stdout_text, stderr_text, exit_code = _drain_cli_process(
+        command,
+        config=config,
+        stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
+    )
     duration_ms = int((time.time() - started) * 1000)
     result = CliRunResult(
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
-        exit_code=int(completed.returncode),
+        stdout=stdout_text,
+        stderr=stderr_text,
+        exit_code=exit_code,
         duration_ms=duration_ms,
     )
     if result.exit_code != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.exit_code}"
         raise RuntimeError(f"CLI process failed: {detail}")
     return result
+
+
+def _drain_cli_process(
+    command: List[str],
+    *,
+    config: ShimConfig,
+    stdin_prompt: str | None,
+) -> tuple[str, str, int]:
+    popen_kwargs = {
+        "cwd": config.cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 0,
+    }
+    if stdin_prompt is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except OSError as exc:
+        raise _translate_spawn_oserror(exc, command=config.command) from exc
+
+    if stdin_prompt is not None and process.stdin is not None:
+        try:
+            process.stdin.write(stdin_prompt)
+            process.stdin.flush()
+        finally:
+            process.stdin.close()
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise RuntimeError("CLI process did not expose stdout/stderr pipes")
+
+    stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+    stderr_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+    stdout_thread = threading.Thread(target=_pump_stream, args=(process.stdout, stdout_queue, "stdout"), daemon=True)
+    stderr_thread = threading.Thread(target=_pump_stream, args=(process.stderr, stderr_queue, "stderr"), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_done = False
+    stderr_done = False
+    last_activity = time.time()
+
+    try:
+        while not stdout_done or not stderr_done:
+            if not stdout_done:
+                try:
+                    item = stdout_queue.get(timeout=0.05)
+                except queue.Empty:
+                    item = None
+                if item is None:
+                    if not stdout_thread.is_alive() and stdout_queue.empty():
+                        stdout_done = True
+                else:
+                    _, chunk = item
+                    last_activity = time.time()
+                    stdout_chunks.append(chunk)
+
+            while True:
+                try:
+                    item = stderr_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    if not stderr_thread.is_alive() and stderr_queue.empty():
+                        stderr_done = True
+                    continue
+                _, chunk = item
+                last_activity = time.time()
+                stderr_chunks.append(chunk)
+
+            if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
+                stderr_done = True
+            if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
+                stdout_done = True
+
+            if time.time() - last_activity > config.timeout:
+                process.kill()
+                raise TimeoutError(
+                    f"CLI process idle for {config.timeout:.1f}s with no stdout/stderr output"
+                )
+
+        stdout_thread.join(timeout=0.2)
+        stderr_thread.join(timeout=0.2)
+        exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        raise
+
+    return "".join(stdout_chunks), "".join(stderr_chunks), int(exit_code)
 
 
 def _pump_stream(
@@ -247,6 +326,7 @@ def stream_cli_prompt(
     stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
     _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
+    last_activity = started
     popen_kwargs = {
         "cwd": config.cwd,
         "stdout": subprocess.PIPE,
@@ -305,6 +385,7 @@ def stream_cli_prompt(
                         stdout_done = True
                 else:
                     _, chunk = item
+                    last_activity = time.time()
                     stdout_chunks.append(chunk)
                     for event in parser.feed(chunk):
                         yield event
@@ -319,6 +400,7 @@ def stream_cli_prompt(
                         stderr_done = True
                     continue
                 _, chunk = item
+                last_activity = time.time()
                 stderr_chunks.append(chunk)
 
             if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
@@ -327,9 +409,11 @@ def stream_cli_prompt(
             if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
                 stdout_done = True
 
-            if time.time() - started > config.timeout:
+            if time.time() - last_activity > config.timeout:
                 process.kill()
-                raise TimeoutError(f"Timed out waiting for CLI process after {config.timeout:.1f}s")
+                raise TimeoutError(
+                    f"CLI process idle for {config.timeout:.1f}s with no stdout/stderr output"
+                )
 
         stdout_thread.join(timeout=0.2)
         stderr_thread.join(timeout=0.2)

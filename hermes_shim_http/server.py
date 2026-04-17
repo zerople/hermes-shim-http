@@ -893,7 +893,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--command", default="claude")
     parser.add_argument("--cwd", default=".")
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--model", action="append", dest="models")
     parser.add_argument("--fallback-model", dest="fallback_model", default=None)
     parser.add_argument("--profile", choices=["auto", "claude", "codex", "opencode", "generic"], default="auto")
