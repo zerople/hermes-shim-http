@@ -126,3 +126,24 @@ test('parseCliOptions keeps remainder args for effective arg reporting', () => {
 
   assert.deepEqual(parsed.providedArgs, ['--verbose', '--foo']);
 });
+
+test('parseCliOptions leaves new server feature flags in passthrough args', () => {
+  const argv = [
+    '--command', 'claude',
+    '--cwd', '/repo',
+    '--cache-path', '/tmp/sessions.sqlite',
+    '--cache-ttl-seconds', '42',
+    '--cache-max-entries', '7',
+    '--compaction', 'window',
+    '--compaction-threshold', '0.75',
+    '--log-level', 'debug',
+    '--log-format', 'json',
+  ];
+
+  const parsed = launcher.parseCliOptions(argv);
+
+  assert.equal(parsed.command, 'claude');
+  assert.equal(parsed.cwd, '/repo');
+  assert.deepEqual(parsed.passthrough, argv);
+  assert.deepEqual(parsed.providedArgs, []);
+});

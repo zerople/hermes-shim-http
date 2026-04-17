@@ -59,3 +59,10 @@ class ShimConfig(BaseModel):
     provider_label: str = "cli-http-shim"
     cli_profile: Literal["auto", "claude", "codex", "opencode", "generic"] = "auto"
     fallback_model: Optional[str] = None
+    cache_path: Optional[str] = None
+    cache_ttl_seconds: float = 3600.0
+    cache_max_entries: int = 256
+    compaction: Literal["off", "summarize", "window"] = "off"
+    compaction_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    log_level: Literal["info", "debug"] = "info"
+    log_format: Literal["text", "json"] = "text"

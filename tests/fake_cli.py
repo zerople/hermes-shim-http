@@ -31,6 +31,12 @@ def main() -> int:
             time.sleep(0.01)
         return 0
 
+    if args.mode == "stream-slow":
+        print("slow", end="", flush=True)
+        time.sleep(0.05)
+        print(" stream", end="", flush=True)
+        return 0
+
     if "read_file" in prompt.lower() and "read the readme" in prompt.lower():
         print('<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>')
     elif "say hello" in prompt.lower():
