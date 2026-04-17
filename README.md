@@ -17,7 +17,7 @@ This package gives you a local provider endpoint that looks like OpenAI-compatib
 - exposes `chat/completions`, `responses`, `models`, and debug observability endpoints
 - bootstraps its Python runtime automatically on first run
 - keeps Hermes as the real tool executor when used as a Hermes provider
-- persists resumable sessions in `~/.cache/hermes-shim-http/sessions.sqlite`
+- supports optional persistent session caching when `--cache-path` is set
 - reports fallback token/context estimates and supports context compaction controls
 - emits structured logs and SSE keepalive pings for long streams
 
@@ -157,6 +157,8 @@ npx @zerople/hermes-shim-http \
 ```
 
 Notes:
+
+- Persistent SQLite session caching is **opt-in**; omit `--cache-path` to keep cache state in memory only.
 
 - `GET /v1/debug/stats` exposes cache, latency, uptime, and token/context aggregates.
 - `GET /v1/debug/quota` returns `{ "status": "unknown" }` until the wrapped CLI exposes real quota data.

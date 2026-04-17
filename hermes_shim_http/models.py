@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
-
-
-def _default_cache_path() -> str:
-    return str(Path("~/.cache/hermes-shim-http/sessions.sqlite").expanduser())
 
 
 class ToolFunction(BaseModel):
@@ -63,7 +58,7 @@ class ShimConfig(BaseModel):
     models: List[str] = Field(default_factory=lambda: ["claude-cli"])
     provider_label: str = "cli-http-shim"
     cli_profile: Literal["auto", "claude", "codex", "opencode", "generic"] = "auto"
-    cache_path: str = Field(default_factory=_default_cache_path)
+    cache_path: Optional[str] = None
     cache_ttl_seconds: float = 3600.0
     cache_max_entries: int = 256
     compaction: Literal["off", "summarize", "window"] = "off"

@@ -687,6 +687,38 @@ def test_slash_commands_are_handled_without_invoking_cli():
     assert "cache" in stats_response.json()["choices"][0]["message"]["content"].lower()
 
 
+def test_compact_command_applies_pending_compaction_to_next_chat_request():
+    client = _client_with_config(compaction="off", compaction_threshold=0.9)
+    base_messages = [
+        {"role": "user", "content": "older context " * 60},
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "follow-up question"},
+        {"role": "assistant", "content": "follow-up answer"},
+    ]
+
+    compact_response = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-cli", "messages": [*base_messages, {"role": "user", "content": "/compact"}]},
+    )
+    assert compact_response.headers["X-Context-Compacted"] == "true"
+    compaction_token = compact_response.headers["X-Compaction-Token"]
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="after compact", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"X-Compaction-Token": compaction_token},
+            json={"model": "claude-cli", "messages": [*base_messages, {"role": "user", "content": "continue"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["X-Context-Compacted"] == "true"
+    sent_prompt = mock_run.call_args.args[0]
+    assert "Summary of earlier conversation" in sent_prompt
+
+
 def test_model_slash_command_overrides_response_model_without_invoking_cli():
     client = _client()
 
@@ -712,6 +744,38 @@ def test_responses_slash_compact_is_handled_locally_without_invoking_cli():
     assert mock_run.call_count == 0
     assert response.headers["X-Context-Compacted"] == "true"
     assert "compaction" in response.json()["output"][0]["content"][0]["text"].lower()
+
+
+def test_responses_compact_command_applies_pending_compaction_to_next_request():
+    client = _client()
+    base_messages = [
+        {"role": "user", "content": "older context " * 60},
+        {"role": "assistant", "content": "ack"},
+        {"role": "user", "content": "follow-up question"},
+        {"role": "assistant", "content": "follow-up answer"},
+    ]
+
+    compact_response = client.post(
+        "/v1/responses",
+        json={"model": "claude-cli", "input": [*base_messages, {"role": "user", "content": "/compact"}]},
+    )
+    assert compact_response.headers["X-Context-Compacted"] == "true"
+    compaction_token = compact_response.headers["X-Compaction-Token"]
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="after compact", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/responses",
+            headers={"X-Compaction-Token": compaction_token},
+            json={"model": "claude-cli", "input": [*base_messages, {"role": "user", "content": "continue"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["X-Context-Compacted"] == "true"
+    sent_prompt = mock_run.call_args.args[0]
+    assert "Summary of earlier conversation" in sent_prompt
 
 
 def test_streaming_keepalive_emits_ping_comments_during_idle_periods(monkeypatch):

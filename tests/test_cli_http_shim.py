@@ -67,6 +67,11 @@ class TestRunner:
         assert cfg.log_level == "debug"
         assert cfg.log_format == "json"
 
+    def test_shim_config_disables_persistent_cache_by_default(self):
+        cfg = ShimConfig(command="claude")
+
+        assert cfg.cache_path is None
+
     def test_shim_config_rejects_invalid_compaction_mode(self):
         with pytest.raises(ValidationError):
             ShimConfig(command="claude", compaction="invalid")

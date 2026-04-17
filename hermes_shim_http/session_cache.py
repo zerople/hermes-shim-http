@@ -44,11 +44,17 @@ class SessionCache:
         max_entries: int = 256,
         ttl_seconds: float = 3600.0,
     ) -> None:
-        self.path = str(Path(path or "~/.cache/hermes-shim-http/sessions.sqlite").expanduser())
+        self.path = str(Path(path).expanduser()) if path else None
         self.max_entries = max_entries
         self.ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._memory_dsn: str | None = None
+        self._keeper: sqlite3.Connection | None = None
+        if self.path:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._memory_dsn = f"file:hermes_shim_http_{id(self)}?mode=memory&cache=shared"
+            self._keeper = sqlite3.connect(self._memory_dsn, uri=True, check_same_thread=False)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -68,7 +74,11 @@ class SessionCache:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, check_same_thread=False)
+        if self.path:
+            return sqlite3.connect(self.path, check_same_thread=False)
+        if not self._memory_dsn:
+            raise RuntimeError("In-memory session cache not initialized")
+        return sqlite3.connect(self._memory_dsn, uri=True, check_same_thread=False)
 
     def plan_request(
         self,

@@ -7,9 +7,10 @@ import queue
 import threading
 import time
 import uuid
+from hashlib import sha256
 from typing import Any, Iterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -249,6 +250,15 @@ def _debug_stats_payload(app: FastAPI) -> dict[str, Any]:
     }
 
 
+def _matching_prefix_length(prefix_messages: list[dict[str, Any]], messages: list[dict[str, Any]]) -> int:
+    if len(prefix_messages) > len(messages):
+        return 0
+    for index, prefix_message in enumerate(prefix_messages):
+        if messages[index] != prefix_message:
+            return 0
+    return len(prefix_messages)
+
+
 def _extract_last_user_text(messages: list[dict[str, Any]]) -> str | None:
     for message in reversed(messages):
         if str(message.get("role") or "").lower() == "user" and isinstance(message.get("content"), str):
@@ -267,6 +277,27 @@ def _messages_without_last_user_command(messages: list[dict[str, Any]]) -> list[
     return trimmed
 
 
+def _pending_compaction_key(*, model: str, base_messages: list[dict[str, Any]]) -> str:
+    payload = {"model": model, "messages": base_messages}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _remember_pending_compaction(app: FastAPI, *, model: str, base_messages: list[dict[str, Any]], compacted_messages: list[dict[str, Any]]) -> str:
+    pending = getattr(app.state, "pending_compactions", {})
+    token = uuid.uuid4().hex
+    pending[token] = {
+        "key": _pending_compaction_key(model=model, base_messages=base_messages),
+        "model": model,
+        "base_messages": base_messages,
+        "compacted_messages": compacted_messages,
+        "created_at": time.time(),
+    }
+    if len(pending) > 128:
+        oldest_key = min(pending.items(), key=lambda item: item[1].get("created_at", 0))[0]
+        pending.pop(oldest_key, None)
+    return token
+
+
 def _apply_slash_compaction(*, messages: list[dict[str, Any]], config: ShimConfig) -> tuple[list[dict[str, Any]], bool]:
     base_messages = _messages_without_last_user_command(messages)
     effective_mode = config.compaction if config.compaction != "off" else "summarize"
@@ -278,6 +309,25 @@ def _apply_slash_compaction(*, messages: list[dict[str, Any]], config: ShimConfi
         force=True,
     )
     return compacted_messages, compacted
+
+
+def _consume_pending_compaction(app: FastAPI, *, token: str | None, messages: list[dict[str, Any]], model: str) -> tuple[list[dict[str, Any]], bool]:
+    if not token:
+        return messages, False
+    pending = getattr(app.state, "pending_compactions", {})
+    stale_keys = [key for key, entry in pending.items() if time.time() - entry.get("created_at", 0) > 600]
+    for key in stale_keys:
+        pending.pop(key, None)
+    entry = pending.pop(token, None)
+    if not entry or entry.get("model") != model:
+        return messages, False
+    base_messages = entry.get("base_messages") or []
+    prefix_len = _matching_prefix_length(base_messages, messages)
+    if prefix_len != len(base_messages):
+        return messages, False
+    compacted_messages = entry.get("compacted_messages") or []
+    remainder = messages[prefix_len:]
+    return [*compacted_messages, *remainder], True
 
 
 def _maybe_apply_compaction(*, messages: list[dict[str, Any]], config: ShimConfig, force: bool = False) -> tuple[list[dict[str, Any]], bool]:
@@ -565,6 +615,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     app.state.session_cache = SessionCache(path=cfg.cache_path, ttl_seconds=cfg.cache_ttl_seconds, max_entries=cfg.cache_max_entries)
     app.state.started_at = time.time()
     app.state.metrics = {"request_count": 0, "cache_hits": 0, "cache_misses": 0, "total_latency_ms": 0.0, "token_context_total": 0, "token_context_max": 0, "token_response_total": 0, "compactions": 0}
+    app.state.pending_compactions = {}
     logger = configure_logger(log_level=cfg.log_level, log_format=cfg.log_format, logger_name=f"hermes_shim_http.{id(app)}")
 
     def _model_payload(model: str) -> dict[str, Any]:
@@ -619,7 +670,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         return {"status": "unknown"}
 
     @app.post("/v1/chat/completions")
-    def chat_completions(request: ChatCompletionsRequest) -> Any:
+    def chat_completions(request: ChatCompletionsRequest, http_request: Request) -> Any:
         request_id = uuid.uuid4().hex
         request_messages = [message.model_dump() for message in request.messages]
         last_user_text = _extract_last_user_text(request_messages)
@@ -633,16 +684,29 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             if slash.command == "compact":
                 compacted_messages, _compacted = _apply_slash_compaction(messages=request_messages, config=cfg)
                 compacted = True
+                compaction_token = _remember_pending_compaction(
+                    app,
+                    model=request.model,
+                    base_messages=_messages_without_last_user_command(request_messages),
+                    compacted_messages=compacted_messages,
+                )
                 compacted_note = str(slash.message["content"])
                 usage = estimate_token_usage(messages=compacted_messages or request_messages, response_text=compacted_note)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
                 payload = _chat_response(model=request.model, parsed=ParsedShimOutput(content=compacted_note), usage=usage)
-                headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
+                headers = {
+                    "X-Request-Id": request_id,
+                    "X-Compaction-Token": compaction_token,
+                    **({"X-Context-Compacted": "true"} if compacted else {}),
+                }
                 return JSONResponse(content=payload, headers=headers)
             payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=str(slash.message["content"])), usage=estimate_token_usage(messages=request_messages, response_text=str(slash.message["content"])))
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
 
-        compacted_messages, compacted = _maybe_apply_compaction(messages=request_messages, config=cfg, force=False)
+        compaction_token = http_request.headers.get("X-Compaction-Token")
+        effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=request_messages, model=request.model)
+        compacted_messages, compacted = _maybe_apply_compaction(messages=effective_messages, config=cfg, force=False)
+        compacted = compacted or pending_compacted
         request_tools = [tool.model_dump() for tool in request.tools] if request.tools else None
         session_cache: SessionCache = app.state.session_cache
         session_plan = session_cache.plan_request(messages=compacted_messages, model=request.model, tools=request_tools, tool_choice=request.tool_choice)
@@ -671,7 +735,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/v1/responses")
-    def responses(body: dict[str, Any]) -> Any:
+    def responses(body: dict[str, Any], http_request: Request) -> Any:
         request_id = uuid.uuid4().hex
         model = str(body.get("model") or (cfg.models[0] if cfg.models else "cli-http-shim"))
         try:
@@ -690,21 +754,35 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             if slash.command == "compact":
                 compacted_messages, _compacted = _apply_slash_compaction(messages=raw_messages, config=cfg)
                 compacted = True
+                compaction_token = _remember_pending_compaction(
+                    app,
+                    model=model,
+                    base_messages=_messages_without_last_user_command(raw_messages),
+                    compacted_messages=compacted_messages,
+                )
                 response_text = str(slash.message["content"])
                 usage = estimate_token_usage(messages=compacted_messages or raw_messages, response_text=response_text)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
                 payload = _responses_json_response(model=model, parsed=ParsedShimOutput(content=response_text), usage=usage)
-                headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
+                headers = {
+                    "X-Request-Id": request_id,
+                    "X-Compaction-Token": compaction_token,
+                    **({"X-Context-Compacted": "true"} if compacted else {}),
+                }
                 return JSONResponse(content=payload, headers=headers)
             response_text = str(slash.message["content"])
             usage = estimate_token_usage(messages=raw_messages, response_text=response_text)
             payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
+        compaction_token = http_request.headers.get("X-Compaction-Token")
+        effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=raw_messages, model=model)
+        body_for_prompt = {**body, "input": effective_messages}
         try:
-            prompt, allowed_tool_names, _normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body, config=cfg, force_compact=False)
+            prompt, allowed_tool_names, _normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body_for_prompt, config=cfg, force_compact=False)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": {"message": exc.detail, "type": "invalid_request_error"}})
 
+        compacted = compacted or pending_compacted
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if body.get("stream"):
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=True)
