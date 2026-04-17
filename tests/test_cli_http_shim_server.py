@@ -30,6 +30,26 @@ def test_models_endpoint_returns_configured_models():
     assert payload["data"][0]["id"] == "claude-cli"
 
 
+def test_model_detail_endpoint_returns_configured_model():
+    client = _client()
+
+    response = client.get("/v1/models/claude-cli")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "claude-cli"
+    assert payload["object"] == "model"
+
+
+def test_model_detail_endpoint_returns_404_for_unknown_model():
+    client = _client()
+
+    response = client.get("/v1/models/not-a-real-model")
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
 def test_health_endpoint_returns_ok():
     client = _client()
 
@@ -52,7 +72,7 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/api/tags").json()["models"][0]["name"] == "claude-cli"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
-    assert client.get("/version").json()["version"] == "0.1.0"
+    assert client.get("/version").json()["version"] == "0.1.1"
 
 
 def test_chat_completions_returns_plain_text():

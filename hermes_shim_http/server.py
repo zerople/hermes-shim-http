@@ -14,7 +14,7 @@ from . import __version__
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt
-from .runner import run_cli_prompt, stream_cli_prompt
+from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt
 
 
 def _chat_response(*, model: str, parsed: ParsedShimOutput) -> dict[str, Any]:
@@ -505,18 +505,18 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     app = FastAPI(title="Hermes CLI HTTP Shim", version=__version__)
     app.state.shim_config = cfg
 
+    def _model_payload(model: str) -> dict[str, Any]:
+        return {
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": cfg.provider_label,
+        }
+
     def _models_payload() -> dict[str, Any]:
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": model,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": cfg.provider_label,
-                }
-                for model in cfg.models
-            ],
+            "data": [_model_payload(model) for model in cfg.models],
         }
 
     def _props_payload() -> dict[str, Any]:
@@ -533,6 +533,12 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     @app.get("/v1/models")
     def models() -> dict[str, Any]:
         return _models_payload()
+
+    @app.get("/v1/models/{model_id:path}")
+    def model_detail(model_id: str) -> dict[str, Any]:
+        if model_id not in cfg.models:
+            raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+        return _model_payload(model_id)
 
     @app.get("/api/v1/models")
     def compat_models() -> dict[str, Any]:
@@ -626,6 +632,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict[str, Any]:
+    return {
+        "host": host,
+        "port": port,
+        "command": config.command,
+        "cwd": config.cwd,
+        "timeout": config.timeout,
+        "models": list(config.models),
+        "provider_label": config.provider_label,
+        "cli_profile": config.cli_profile,
+        "provided_args": list(config.args),
+        "effective_args": resolved_cli_args(config),
+    }
+
+
 def main() -> None:
     parser = _build_arg_parser()
     ns = parser.parse_args()
@@ -642,6 +663,8 @@ def main() -> None:
     )
     import uvicorn
 
+    print("[hermes-shim-http] effective startup config:")
+    print(json.dumps(_startup_config_payload(host=ns.host, port=ns.port, config=config), indent=2, ensure_ascii=False))
     uvicorn.run(create_app(config), host=ns.host, port=ns.port)
 
 

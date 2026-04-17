@@ -45,22 +45,22 @@ class TestPrompting:
 
 
 class TestRunner:
-    def test_build_cli_command_combines_command_args_and_prompt(self):
+    def test_build_cli_command_keeps_claude_prompt_off_argv(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work")
 
         cmd = build_cli_command(cfg, "hello")
 
-        assert cmd == ["claude", "-p", "hello"]
+        assert cmd == ["claude", "-p"]
 
     def test_build_cli_command_uses_profile_defaults_for_supported_clis(self):
-        assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == ["claude", "-p", "hello"]
+        assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == ["claude", "-p"]
         assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
         assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
 
     def test_run_cli_prompt_returns_result(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
         completed = subprocess.CompletedProcess(
-            args=["claude", "-p", "hello"],
+            args=["claude", "-p"],
             returncode=0,
             stdout="done",
             stderr="",
@@ -73,12 +73,20 @@ class TestRunner:
         assert result.stdout == "done"
         assert result.stderr == ""
         assert result.exit_code == 0
-        mock_run.assert_called_once()
+        mock_run.assert_called_once_with(
+            ["claude", "-p"],
+            cwd="/tmp/work",
+            capture_output=True,
+            text=True,
+            input="hello",
+            timeout=12.0,
+            check=False,
+        )
 
     def test_run_cli_prompt_raises_on_non_zero_exit(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
         completed = subprocess.CompletedProcess(
-            args=["claude", "-p", "hello"],
+            args=["claude", "-p"],
             returncode=1,
             stdout="",
             stderr="boom",
@@ -98,6 +106,55 @@ class TestRunner:
             with pytest.raises(TimeoutError, match="Timed out"):
                 run_cli_prompt("hello", cfg)
 
+    def test_run_cli_prompt_translates_argument_list_too_long_error(self):
+        cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)
+
+        with patch(
+            "hermes_shim_http.runner.subprocess.run",
+            side_effect=OSError(7, "Argument list too long", "codex"),
+        ):
+            with pytest.raises(RuntimeError, match="Prompt too large to pass on the command line"):
+                run_cli_prompt("hello", cfg)
+
+    def test_stream_cli_prompt_uses_stdin_for_claude_profile(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+
+        class _FakeStream:
+            def read(self, _size: int = 1) -> str:
+                return ""
+
+            def close(self) -> None:
+                return None
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = _FakeStream()
+                self.stderr = _FakeStream()
+                self.stdin = None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                return None
+
+        with patch("hermes_shim_http.runner.subprocess.Popen", return_value=_FakeProcess()) as mock_popen:
+            events = list(stream_cli_prompt("hello", cfg))
+
+        assert events == []
+        mock_popen.assert_called_once_with(
+            ["claude", "-p"],
+            cwd="/tmp/work",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=0,
+        )
+
     def test_stream_cli_prompt_yields_text_chunks_live(self):
         cfg = ShimConfig(
             command="python3",
@@ -111,6 +168,16 @@ class TestRunner:
         assert events
         assert all(event.kind == "text" for event in events)
         assert "".join(event.text or "" for event in events) == "Streaming hello from fake CLI\n"
+
+    def test_stream_cli_prompt_translates_argument_list_too_long_error(self):
+        cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)
+
+        with patch(
+            "hermes_shim_http.runner.subprocess.Popen",
+            side_effect=OSError(7, "Argument list too long", "codex"),
+        ):
+            with pytest.raises(RuntimeError, match="Prompt too large to pass on the command line"):
+                list(stream_cli_prompt("hello", cfg))
 
     def test_stream_cli_prompt_yields_tool_call_event_without_wrapper_text(self):
         cfg = ShimConfig(

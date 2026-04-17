@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import queue
 import subprocess
@@ -35,24 +36,58 @@ def _resolved_args(config: ShimConfig) -> list[str]:
     }[profile]
 
 
+def _pipes_prompt_via_stdin(config: ShimConfig) -> bool:
+    profile = config.cli_profile
+    if profile == "auto":
+        profile = {
+            "claude": "claude",
+            "codex": "codex",
+            "opencode": "opencode",
+        }.get(_command_basename(config.command), "generic")
+    return profile == "claude"
+
+
+def resolved_cli_args(config: ShimConfig) -> list[str]:
+    return _resolved_args(config)
+
+
 def build_cli_command(config: ShimConfig, prompt_text: str) -> List[str]:
-    return [config.command, *_resolved_args(config), prompt_text]
+    command = [config.command, *_resolved_args(config)]
+    if _pipes_prompt_via_stdin(config):
+        return command
+    return [*command, prompt_text]
+
+
+def _translate_spawn_oserror(exc: OSError, *, command: str) -> RuntimeError:
+    if exc.errno == errno.E2BIG:
+        return RuntimeError(
+            f"Prompt too large to pass on the command line for '{command}'. "
+            "Use a CLI/profile that accepts stdin input, reduce prompt size, or update the shim to stream via stdin/file input."
+        )
+    return RuntimeError(f"Failed to start CLI process '{command}': {exc}")
 
 
 def run_cli_prompt(prompt_text: str, config: ShimConfig) -> CliRunResult:
     command = build_cli_command(config, prompt_text)
     started = time.time()
+    run_kwargs = {
+        "cwd": config.cwd,
+        "capture_output": True,
+        "text": True,
+        "timeout": config.timeout,
+        "check": False,
+    }
+    if _pipes_prompt_via_stdin(config):
+        run_kwargs["input"] = prompt_text
     try:
         completed = subprocess.run(
             command,
-            cwd=config.cwd,
-            capture_output=True,
-            text=True,
-            timeout=config.timeout,
-            check=False,
+            **run_kwargs,
         )
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(f"Timed out waiting for CLI process after {config.timeout:.1f}s") from exc
+    except OSError as exc:
+        raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     duration_ms = int((time.time() - started) * 1000)
     result = CliRunResult(
@@ -85,14 +120,27 @@ def _pump_stream(stream, sink: queue.Queue[tuple[str, str] | None], stream_name:
 def stream_cli_prompt(prompt_text: str, config: ShimConfig) -> Iterator[CliStreamEvent]:
     command = build_cli_command(config, prompt_text)
     started = time.time()
-    process = subprocess.Popen(
-        command,
-        cwd=config.cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=0,
-    )
+    popen_kwargs = {
+        "cwd": config.cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "bufsize": 0,
+    }
+    if _pipes_prompt_via_stdin(config):
+        popen_kwargs["stdin"] = subprocess.PIPE
+    try:
+        process = subprocess.Popen(
+            command,
+            **popen_kwargs,
+        )
+    except OSError as exc:
+        raise _translate_spawn_oserror(exc, command=config.command) from exc
+
+    if _pipes_prompt_via_stdin(config) and process.stdin is not None:
+        process.stdin.write(prompt_text)
+        process.stdin.flush()
+        process.stdin.close()
     if process.stdout is None or process.stderr is None:
         process.kill()
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
