@@ -10,45 +10,98 @@ from typing import Iterator, List
 
 from .models import CliRunResult, CliStreamEvent, ShimConfig
 from .parsing import IncrementalToolCallParser
+from .telemetry import emit_event
+
+
+_DEFAULT_CHUNK_SIZE = 4096
+_CLAUDE_APPEND_SYSTEM_PROMPT = "Be concise and follow the user's instructions exactly."
 
 
 def _command_basename(command: str) -> str:
     return os.path.basename((command or "").strip()).lower()
 
 
+def _resolved_profile(config: ShimConfig) -> str:
+    profile = config.cli_profile
+    if profile == "auto":
+        profile = {
+            "claude": "claude",
+            "codex": "codex",
+            "opencode": "opencode",
+        }.get(_command_basename(config.command), "generic")
+    return profile
+
+
 def _resolved_args(config: ShimConfig) -> list[str]:
     if config.args:
         return list(config.args)
 
-    profile = config.cli_profile
-    if profile == "auto":
-        profile = {
-            "claude": "claude",
-            "codex": "codex",
-            "opencode": "opencode",
-        }.get(_command_basename(config.command), "generic")
-
     return {
-        "claude": ["-p"],
+        "claude": ["-p", "--dangerously-skip-permissions"],
         "codex": ["exec"],
         "opencode": ["run"],
         "generic": [],
-    }[profile]
+    }[_resolved_profile(config)]
 
 
 def _pipes_prompt_via_stdin(config: ShimConfig) -> bool:
-    profile = config.cli_profile
-    if profile == "auto":
-        profile = {
-            "claude": "claude",
-            "codex": "codex",
-            "opencode": "opencode",
-        }.get(_command_basename(config.command), "generic")
-    return profile == "claude"
+    return _resolved_profile(config) == "claude"
+
+
+def supports_cli_resume(config: ShimConfig) -> bool:
+    return _resolved_profile(config) == "claude"
 
 
 def resolved_cli_args(config: ShimConfig) -> list[str]:
     return _resolved_args(config)
+
+
+def _is_meaningful_model(model: str | None) -> bool:
+    if not model:
+        return False
+    value = model.strip().lower()
+    if not value:
+        return False
+    return value not in {"cli-http-shim", "default", "auto"}
+
+
+def _log_cli_dispatch(
+    command: list[str],
+    *,
+    stdin_bytes: int,
+    session_id: str | None,
+    resume_session_id: str | None,
+) -> None:
+    flags = command[1:]
+    emit_event(
+        "cli_dispatch",
+        argv=flags,
+        append_system_prompt_used="--append-system-prompt" in flags,
+        model_flag_used="--model" in flags,
+        model_value=flags[flags.index("--model") + 1] if "--model" in flags else None,
+        resume_used=resume_session_id is not None,
+        session_id=session_id,
+        resume_session_id=resume_session_id,
+        stdin_bytes=stdin_bytes,
+    )
+
+
+def _combine_prompt_text(prompt_text: str, *, system_prompt: str | None = None) -> str:
+    if system_prompt:
+        return f"{system_prompt}\n\n{prompt_text}" if prompt_text else system_prompt
+    return prompt_text
+
+
+def _stdin_prompt_text(
+    config: ShimConfig,
+    prompt_text: str,
+    *,
+    system_prompt: str | None = None,
+    resume_session_id: str | None = None,
+) -> str:
+    if _resolved_profile(config) == "claude" and resume_session_id:
+        return prompt_text
+    return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
 
 
 def build_cli_command(
@@ -57,15 +110,27 @@ def build_cli_command(
     *,
     session_id: str | None = None,
     resume_session_id: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
 ) -> List[str]:
-    command = [config.command, *_resolved_args(config)]
-    if _pipes_prompt_via_stdin(config) and session_id:
-        if resume_session_id:
-            command.extend(["--resume", resume_session_id, "--fork-session"])
-        command.extend(["--session-id", session_id])
-    if _pipes_prompt_via_stdin(config):
+    base = [config.command, *_resolved_args(config)]
+    combined = _combine_prompt_text(prompt_text, system_prompt=system_prompt)
+
+    if _resolved_profile(config) == "claude":
+        command = list(base)
+        if not resume_session_id:
+            command.extend(["--append-system-prompt", _CLAUDE_APPEND_SYSTEM_PROMPT])
+        if _is_meaningful_model(model):
+            command.extend(["--model", str(model).strip()])
+        if config.fallback_model:
+            command.extend(["--fallback-model", config.fallback_model])
+        if session_id:
+            if resume_session_id:
+                command.extend(["--resume", resume_session_id, "--fork-session"])
+            command.extend(["--session-id", session_id])
         return command
-    return [*command, prompt_text]
+
+    return [*base, combined]
 
 
 def _translate_spawn_oserror(exc: OSError, *, command: str) -> RuntimeError:
@@ -83,8 +148,25 @@ def run_cli_prompt(
     *,
     session_id: str | None = None,
     resume_session_id: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
 ) -> CliRunResult:
-    command = build_cli_command(config, prompt_text, session_id=session_id, resume_session_id=resume_session_id)
+    stdin_prompt = _stdin_prompt_text(
+        config,
+        prompt_text,
+        system_prompt=system_prompt,
+        resume_session_id=resume_session_id,
+    )
+    command = build_cli_command(
+        config,
+        prompt_text,
+        session_id=session_id,
+        resume_session_id=resume_session_id,
+        system_prompt=system_prompt,
+        model=model,
+    )
+    stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
+    _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
     run_kwargs = {
         "cwd": config.cwd,
@@ -94,7 +176,7 @@ def run_cli_prompt(
         "check": False,
     }
     if _pipes_prompt_via_stdin(config):
-        run_kwargs["input"] = prompt_text
+        run_kwargs["input"] = stdin_prompt
     try:
         completed = subprocess.run(
             command,
@@ -118,7 +200,13 @@ def run_cli_prompt(
     return result
 
 
-def _pump_stream(stream, sink: queue.Queue[tuple[str, str] | None], stream_name: str, *, chunk_size: int = 1) -> None:
+def _pump_stream(
+    stream,
+    sink: queue.Queue[tuple[str, str] | None],
+    stream_name: str,
+    *,
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+) -> None:
     try:
         while True:
             chunk = stream.read(chunk_size)
@@ -139,8 +227,25 @@ def stream_cli_prompt(
     *,
     session_id: str | None = None,
     resume_session_id: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
 ) -> Iterator[CliStreamEvent]:
-    command = build_cli_command(config, prompt_text, session_id=session_id, resume_session_id=resume_session_id)
+    stdin_prompt = _stdin_prompt_text(
+        config,
+        prompt_text,
+        system_prompt=system_prompt,
+        resume_session_id=resume_session_id,
+    )
+    command = build_cli_command(
+        config,
+        prompt_text,
+        session_id=session_id,
+        resume_session_id=resume_session_id,
+        system_prompt=system_prompt,
+        model=model,
+    )
+    stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
+    _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
     started = time.time()
     popen_kwargs = {
         "cwd": config.cwd,
@@ -160,7 +265,7 @@ def stream_cli_prompt(
         raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     if _pipes_prompt_via_stdin(config) and process.stdin is not None:
-        process.stdin.write(prompt_text)
+        process.stdin.write(stdin_prompt)
         process.stdin.flush()
         process.stdin.close()
     if process.stdout is None or process.stderr is None:
@@ -178,13 +283,11 @@ def stream_cli_prompt(
     stdout_thread = threading.Thread(
         target=_pump_stream,
         args=(process.stdout, stdout_queue, "stdout"),
-        kwargs={"chunk_size": 1},
         daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_pump_stream,
         args=(process.stderr, stderr_queue, "stderr"),
-        kwargs={"chunk_size": 1},
         daemon=True,
     )
     stdout_thread.start()

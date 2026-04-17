@@ -19,9 +19,10 @@ from .logging_utils import configure_logger, emit_log
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt, compact_messages
-from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt
+from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
 from .slash_commands import dispatch_slash_command
+from .telemetry import emit_event
 from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_token_usage
 
 KEEPALIVE_INTERVAL_SECONDS = 10.0
@@ -42,10 +43,7 @@ def _usage_dict(estimate: TokenUsageEstimate) -> dict[str, int]:
 
 def _chat_response(*, model: str, parsed: ParsedShimOutput, usage: TokenUsageEstimate) -> dict[str, Any]:
     finish_reason = "tool_calls" if parsed.tool_calls else "stop"
-    message: dict[str, Any] = {
-        "role": "assistant",
-        "content": parsed.content,
-    }
+    message: dict[str, Any] = {"role": "assistant", "content": parsed.content}
     if parsed.tool_calls:
         message["tool_calls"] = parsed.tool_calls
     return {
@@ -53,13 +51,7 @@ def _chat_response(*, model: str, parsed: ParsedShimOutput, usage: TokenUsageEst
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }
-        ],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": _usage_dict(usage),
     }
 
@@ -145,6 +137,100 @@ def _sse_line(payload: dict[str, Any] | str) -> bytes:
     return f"data: {body}\n\n".encode("utf-8")
 
 
+def _message_content_len(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, str):
+                total += len(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+                else:
+                    total += len(json.dumps(item, ensure_ascii=False))
+            else:
+                total += len(str(item))
+        return total
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return len(text)
+        return len(json.dumps(content, ensure_ascii=False))
+    return len(str(content))
+
+
+def _last_user_message_len(messages: list[dict[str, Any]]) -> int:
+    for message in reversed(messages):
+        if str(message.get("role") or "").strip().lower() == "user":
+            return _message_content_len(message.get("content"))
+    return 0
+
+
+def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
+    names: list[str] = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def _safe_json_size_bytes(payload: Any) -> int | None:
+    try:
+        return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _log_chat_request_summary(*, request: ChatCompletionsRequest, request_messages: list[dict[str, Any]], request_tools: list[dict[str, Any]] | None, session_plan: SessionPlan) -> None:
+    emit_event(
+        "chat_completions_request",
+        model=request.model,
+        stream=bool(request.stream),
+        message_count=len(request_messages),
+        message_roles=[str(message.get("role") or "") for message in request_messages],
+        last_user_message_len=_last_user_message_len(request_messages),
+        tool_count=len(request_tools or []),
+        tool_names=_tool_names(request_tools)[:20],
+        tool_choice_present=request.tool_choice is not None,
+        request_json_bytes=_safe_json_size_bytes(
+            {
+                "model": request.model,
+                "stream": request.stream,
+                "messages": request_messages,
+                "tools": request_tools,
+                "tool_choice": request.tool_choice,
+            }
+        ),
+        system_prompt_len=len(session_plan.system_prompt_text or ""),
+        cli_prompt_len=len(session_plan.prompt_text or ""),
+        resume_used=session_plan.resume_session_id is not None,
+        prefix_message_count=session_plan.prefix_message_count,
+    )
+
+
+def _log_responses_request_summary(*, body: dict[str, Any], messages: list[dict[str, Any]], normalized_tools: list[dict[str, Any]] | None, prompt: str) -> None:
+    emit_event(
+        "responses_request",
+        model=str(body.get("model") or ""),
+        stream=bool(body.get("stream")),
+        message_count=len(messages),
+        message_roles=[str(message.get("role") or "") for message in messages],
+        last_user_message_len=_last_user_message_len(messages),
+        tool_count=len(normalized_tools or []),
+        tool_names=_tool_names(normalized_tools)[:20],
+        tool_choice_present=body.get("tool_choice") is not None,
+        request_json_bytes=_safe_json_size_bytes(body),
+        cli_prompt_len=len(prompt or ""),
+    )
+
+
 def _stream_chunk_for_text(*, completion_id: str, created: int, model: str, text: str) -> dict[str, Any]:
     return {
         "id": completion_id,
@@ -198,7 +284,7 @@ def _iter_events_with_keepalive(source: Iterator[CliStreamEvent], *, keepalive_i
             for item in source:
                 sink.put(item)
             sink.put(sentinel)
-        except BaseException as exc:  # pragma: no cover - defensive
+        except BaseException as exc:  # pragma: no cover
             sink.put(exc)
             sink.put(sentinel)
 
@@ -301,14 +387,13 @@ def _remember_pending_compaction(app: FastAPI, *, model: str, base_messages: lis
 def _apply_slash_compaction(*, messages: list[dict[str, Any]], config: ShimConfig) -> tuple[list[dict[str, Any]], bool]:
     base_messages = _messages_without_last_user_command(messages)
     effective_mode = config.compaction if config.compaction != "off" else "summarize"
-    compacted_messages, compacted = compact_messages(
+    return compact_messages(
         messages=base_messages,
         mode=effective_mode,
         threshold=config.compaction_threshold,
         context_limit=DEFAULT_CONTEXT_LIMIT,
         force=True,
     )
-    return compacted_messages, compacted
 
 
 def _consume_pending_compaction(app: FastAPI, *, token: str | None, messages: list[dict[str, Any]], model: str) -> tuple[list[dict[str, Any]], bool]:
@@ -326,8 +411,7 @@ def _consume_pending_compaction(app: FastAPI, *, token: str | None, messages: li
     if prefix_len != len(base_messages):
         return messages, False
     compacted_messages = entry.get("compacted_messages") or []
-    remainder = messages[prefix_len:]
-    return [*compacted_messages, *remainder], True
+    return [*compacted_messages, *messages[prefix_len:]], True
 
 
 def _maybe_apply_compaction(*, messages: list[dict[str, Any]], config: ShimConfig, force: bool = False) -> tuple[list[dict[str, Any]], bool]:
@@ -419,7 +503,15 @@ def _normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
         item_type = item.get("type")
         if item_type == "function_call":
             call_id = str(item.get("call_id") or item.get("id") or f"call_{idx}")
-            messages.append({"role": "assistant", "content": f"<tool_call>{json.dumps({'id': call_id, 'type': 'function', 'function': {'name': str(item.get('name') or '').strip(), 'arguments': str(item.get('arguments') or '{}')}} , ensure_ascii=False)}</tool_call>"})
+            tool_call = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": str(item.get("name") or "").strip(),
+                    "arguments": str(item.get("arguments") or "{}"),
+                },
+            }
+            messages.append({"role": "assistant", "content": f"<tool_call>{json.dumps(tool_call, ensure_ascii=False)}</tool_call>"})
             continue
         if item_type == "function_call_output":
             messages.append({"role": "tool", "tool_call_id": str(item.get("call_id") or "").strip() or None, "content": str(item.get("output") or "")})
@@ -455,20 +547,7 @@ def _responses_prompt_from_body(body: dict[str, Any], *, config: ShimConfig, for
     return prompt, allowed_tool_names or set(), normalized_tools, compacted_messages, compacted
 
 
-def _stream_live_chat_chunks(
-    *,
-    app: FastAPI,
-    request_id: str,
-    logger: logging.Logger,
-    model: str,
-    request_messages: list[dict[str, Any]],
-    prompt: str,
-    config: ShimConfig,
-    allowed_tool_names: set[str] | None,
-    session_plan: SessionPlan,
-    session_cache: SessionCache,
-    compacted: bool,
-) -> Iterator[bytes]:
+def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, request_messages: list[dict[str, Any]], prompt: str, config: ShimConfig, allowed_tool_names: set[str] | None, session_plan: SessionPlan, session_cache: SessionCache, compacted: bool) -> Iterator[bytes]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     saw_tool_calls = False
@@ -482,7 +561,14 @@ def _stream_live_chat_chunks(
     yield _sse_line({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
 
     try:
-        source = stream_cli_prompt(prompt, config, session_id=session_plan.session_id, resume_session_id=session_plan.resume_session_id)
+        source = stream_cli_prompt(
+            prompt,
+            config,
+            session_id=session_plan.session_id,
+            resume_session_id=session_plan.resume_session_id,
+            system_prompt=session_plan.system_prompt_text,
+            model=model,
+        )
         for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
                 yield b": ping\n\n"
@@ -520,18 +606,7 @@ def _stream_live_chat_chunks(
         raise
 
 
-def _stream_live_responses_events(
-    *,
-    app: FastAPI,
-    request_id: str,
-    logger: logging.Logger,
-    model: str,
-    prompt: str,
-    request_messages: list[dict[str, Any]],
-    config: ShimConfig,
-    allowed_tool_names: set[str] | None,
-    compacted: bool,
-) -> Iterator[bytes]:
+def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, compacted: bool) -> Iterator[bytes]:
     response_id = f"resp_{uuid.uuid4().hex[:28]}"
     created_at = int(time.time())
     pending_text = ""
@@ -567,16 +642,17 @@ def _stream_live_responses_events(
         yield _sse_line({"type": "response.output_item.added", "output_index": pending_text_output_index, "item": {"type": "message", "id": pending_text_item_id, "role": "assistant", "status": "in_progress", "content": []}})
 
     try:
-        for event in _iter_events_with_keepalive(stream_cli_prompt(prompt, config), keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
+        for event in _iter_events_with_keepalive(stream_cli_prompt(prompt, config, model=model), keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
                 yield b": ping\n\n"
                 continue
             if event.kind == "tool_call" and event.tool_call:
                 name = str(event.tool_call.get("function", {}).get("name") or "").strip()
                 if allowed_tool_names is not None and name not in allowed_tool_names:
-                    pending_text += _unsupported_tool_message([name])
+                    fallback_text = _unsupported_tool_message([name])
+                    pending_text += fallback_text
                     yield from ensure_text_item_started()
-                    yield _sse_line({"type": "response.output_text.delta", "delta": _unsupported_tool_message([name]), "output_index": pending_text_output_index, "content_index": 0})
+                    yield _sse_line({"type": "response.output_text.delta", "delta": fallback_text, "output_index": pending_text_output_index, "content_index": 0})
                     continue
                 yield from flush_text()
                 item = {"type": "function_call", "id": f"fc_{uuid.uuid4().hex[:24]}", "call_id": event.tool_call["id"], "name": event.tool_call["function"]["name"], "arguments": event.tool_call["function"]["arguments"]}
@@ -676,31 +752,23 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         last_user_text = _extract_last_user_text(request_messages)
         slash = dispatch_slash_command(last_user_text or "", model=request.model, stats=_debug_stats_payload(app)) if last_user_text else None
         if slash is not None:
+            response_text = str(slash.message["content"])
             if slash.command == "clear":
                 app.state.session_cache.clear()
-                usage = estimate_token_usage(messages=request_messages, response_text=str(slash.message["content"]))
-                payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=str(slash.message["content"])), usage=usage)
+                usage = estimate_token_usage(messages=request_messages, response_text=response_text)
+                payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
             if slash.command == "compact":
                 compacted_messages, _compacted = _apply_slash_compaction(messages=request_messages, config=cfg)
                 compacted = True
-                compaction_token = _remember_pending_compaction(
-                    app,
-                    model=request.model,
-                    base_messages=_messages_without_last_user_command(request_messages),
-                    compacted_messages=compacted_messages,
-                )
-                compacted_note = str(slash.message["content"])
-                usage = estimate_token_usage(messages=compacted_messages or request_messages, response_text=compacted_note)
+                compaction_token = _remember_pending_compaction(app, model=request.model, base_messages=_messages_without_last_user_command(request_messages), compacted_messages=compacted_messages)
+                usage = estimate_token_usage(messages=compacted_messages or request_messages, response_text=response_text)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
-                payload = _chat_response(model=request.model, parsed=ParsedShimOutput(content=compacted_note), usage=usage)
-                headers = {
-                    "X-Request-Id": request_id,
-                    "X-Compaction-Token": compaction_token,
-                    **({"X-Context-Compacted": "true"} if compacted else {}),
-                }
+                payload = _chat_response(model=request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
+                headers = {"X-Request-Id": request_id, "X-Compaction-Token": compaction_token, **({"X-Context-Compacted": "true"} if compacted else {})}
                 return JSONResponse(content=payload, headers=headers)
-            payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=str(slash.message["content"])), usage=estimate_token_usage(messages=request_messages, response_text=str(slash.message["content"])))
+            usage = estimate_token_usage(messages=request_messages, response_text=response_text)
+            payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
 
         compaction_token = http_request.headers.get("X-Compaction-Token")
@@ -709,7 +777,21 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         compacted = compacted or pending_compacted
         request_tools = [tool.model_dump() for tool in request.tools] if request.tools else None
         session_cache: SessionCache = app.state.session_cache
-        session_plan = session_cache.plan_request(messages=compacted_messages, model=request.model, tools=request_tools, tool_choice=request.tool_choice)
+        if supports_cli_resume(cfg):
+            session_plan = session_cache.plan_request(messages=compacted_messages, model=request.model, tools=request_tools, tool_choice=request.tool_choice)
+        else:
+            session_plan = SessionPlan(
+                session_id=str(uuid.uuid4()),
+                resume_session_id=None,
+                prompt_text=build_cli_prompt(messages=compacted_messages, model=request.model, tools=request_tools, tool_choice=request.tool_choice),
+                system_prompt_text=None,
+                prefix_message_count=0,
+                messages=compacted_messages,
+                model=request.model,
+                tools=request_tools,
+                tool_choice=request.tool_choice,
+            )
+        _log_chat_request_summary(request=request, request_messages=compacted_messages, request_tools=request_tools, session_plan=session_plan)
         allowed_tool_names = _allowed_tool_names_from_tools(request_tools)
         emit_log(logger, event="cache_hit" if session_plan.resume_session_id else "cache_miss", request_id=request_id, model=request.model)
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
@@ -723,7 +805,14 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         try:
             started = time.time()
             emit_log(logger, event="spawn", request_id=request_id, model=request.model, stream=False)
-            result = run_cli_prompt(session_plan.prompt_text, cfg, session_id=session_plan.session_id, resume_session_id=session_plan.resume_session_id)
+            result = run_cli_prompt(
+                session_plan.prompt_text,
+                cfg,
+                session_id=session_plan.session_id,
+                resume_session_id=session_plan.resume_session_id,
+                system_prompt=session_plan.system_prompt_text,
+                model=request.model,
+            )
             parsed = _sanitize_parsed_output(parse_cli_output(result.stdout), allowed_tool_names)
             session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
             usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
@@ -745,44 +834,34 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         last_user_text = _extract_last_user_text(raw_messages)
         slash = dispatch_slash_command(last_user_text or "", model=model, stats=_debug_stats_payload(app)) if last_user_text else None
         if slash is not None:
+            response_text = str(slash.message["content"])
             if slash.command == "clear":
                 app.state.session_cache.clear()
-                response_text = str(slash.message["content"])
                 usage = estimate_token_usage(messages=raw_messages, response_text=response_text)
                 payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
             if slash.command == "compact":
                 compacted_messages, _compacted = _apply_slash_compaction(messages=raw_messages, config=cfg)
                 compacted = True
-                compaction_token = _remember_pending_compaction(
-                    app,
-                    model=model,
-                    base_messages=_messages_without_last_user_command(raw_messages),
-                    compacted_messages=compacted_messages,
-                )
-                response_text = str(slash.message["content"])
+                compaction_token = _remember_pending_compaction(app, model=model, base_messages=_messages_without_last_user_command(raw_messages), compacted_messages=compacted_messages)
                 usage = estimate_token_usage(messages=compacted_messages or raw_messages, response_text=response_text)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
                 payload = _responses_json_response(model=model, parsed=ParsedShimOutput(content=response_text), usage=usage)
-                headers = {
-                    "X-Request-Id": request_id,
-                    "X-Compaction-Token": compaction_token,
-                    **({"X-Context-Compacted": "true"} if compacted else {}),
-                }
+                headers = {"X-Request-Id": request_id, "X-Compaction-Token": compaction_token, **({"X-Context-Compacted": "true"} if compacted else {})}
                 return JSONResponse(content=payload, headers=headers)
-            response_text = str(slash.message["content"])
             usage = estimate_token_usage(messages=raw_messages, response_text=response_text)
             payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
+
         compaction_token = http_request.headers.get("X-Compaction-Token")
         effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=raw_messages, model=model)
         body_for_prompt = {**body, "input": effective_messages}
         try:
-            prompt, allowed_tool_names, _normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body_for_prompt, config=cfg, force_compact=False)
+            prompt, allowed_tool_names, normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body_for_prompt, config=cfg, force_compact=False)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": {"message": exc.detail, "type": "invalid_request_error"}})
-
         compacted = compacted or pending_compacted
+        _log_responses_request_summary(body=body_for_prompt, messages=compacted_messages, normalized_tools=normalized_tools, prompt=prompt)
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if body.get("stream"):
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=True)
@@ -794,7 +873,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         try:
             started = time.time()
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
-            result = run_cli_prompt(prompt, cfg)
+            result = run_cli_prompt(prompt, cfg, model=model)
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
             usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
@@ -816,6 +895,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--model", action="append", dest="models")
+    parser.add_argument("--fallback-model", dest="fallback_model", default=None)
     parser.add_argument("--profile", choices=["auto", "claude", "codex", "opencode", "generic"], default="auto")
     parser.add_argument("--cache-path")
     parser.add_argument("--cache-ttl-seconds", type=float, default=3600.0)
@@ -836,6 +916,7 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "cwd": config.cwd,
         "timeout": config.timeout,
         "models": list(config.models),
+        "fallback_model": config.fallback_model,
         "provider_label": config.provider_label,
         "cli_profile": config.cli_profile,
         "provided_args": list(config.args),
@@ -863,6 +944,7 @@ def main() -> None:
         timeout=ns.timeout,
         models=ns.models or ["claude-cli"],
         cli_profile=ns.profile,
+        fallback_model=ns.fallback_model,
         cache_path=ns.cache_path or ShimConfig(command=ns.command).cache_path,
         cache_ttl_seconds=ns.cache_ttl_seconds,
         cache_max_entries=ns.cache_max_entries,

@@ -1,3 +1,4 @@
+import json
 import logging
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ def _client():
             args=["-p"],
             cwd="/tmp",
             timeout=30.0,
-            models=["claude-cli"],
+            models=["sonnet"],
         )
     )
     return TestClient(app)
@@ -41,17 +42,17 @@ def test_models_endpoint_returns_configured_models():
     assert response.status_code == 200
     payload = response.json()
     assert payload["object"] == "list"
-    assert payload["data"][0]["id"] == "claude-cli"
+    assert payload["data"][0]["id"] == "sonnet"
 
 
 def test_model_detail_endpoint_returns_configured_model():
     client = _client()
 
-    response = client.get("/v1/models/claude-cli")
+    response = client.get("/v1/models/sonnet")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["id"] == "claude-cli"
+    assert payload["id"] == "sonnet"
     assert payload["object"] == "model"
 
 
@@ -83,7 +84,7 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/version").status_code == 200
 
     assert client.get("/api/v1/models").json()["object"] == "list"
-    assert client.get("/api/tags").json()["models"][0]["name"] == "claude-cli"
+    assert client.get("/api/tags").json()["models"][0]["name"] == "sonnet"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
     assert client.get("/version").json()["version"] == __version__
@@ -99,7 +100,7 @@ def test_chat_completions_returns_plain_text():
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
@@ -110,6 +111,81 @@ def test_chat_completions_returns_plain_text():
     assert payload["choices"][0]["finish_reason"] == "stop"
     assert mock_run.call_args.kwargs["session_id"]
     assert mock_run.call_args.kwargs["resume_session_id"] is None
+
+
+def test_non_claude_chat_completions_keep_full_transcript_without_resume():
+    client = TestClient(
+        create_app(
+            ShimConfig(
+                command="codex",
+                args=["exec"],
+                cwd="/tmp",
+                timeout=30.0,
+                models=["codex"],
+            )
+        )
+    )
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="ok", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "codex",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert "<user>\nhello\n</user>\n\n<assistant>\nhi\n</assistant>\n\n<user>\ncontinue\n</user>" in mock_run.call_args.args[0]
+    assert mock_run.call_args.kwargs["resume_session_id"] is None
+
+
+def test_chat_completions_logs_request_summary(capsys):
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="Hello from Claude", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "stream": False,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    stdout = capsys.readouterr().out
+    summary_logs = [line for line in stdout.splitlines() if "chat_completions_request" in line]
+    assert summary_logs
+    payload = json.loads(summary_logs[-1].split("[hermes-shim-http] ", 1)[1])
+    assert payload["event"] == "chat_completions_request"
+    assert payload["model"] == "sonnet"
+    assert payload["stream"] is False
+    assert payload["message_count"] == 1
+    assert payload["tool_count"] == 1
+    assert payload["tool_names"] == ["read_file"]
+    assert payload["last_user_message_len"] == 5
+    assert payload["request_json_bytes"] > 0
 
 
 def test_chat_completions_returns_tool_calls():
@@ -127,7 +203,7 @@ def test_chat_completions_returns_tool_calls():
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Read the readme"}],
                 "tools": [
                     {
@@ -158,14 +234,14 @@ def test_chat_completions_reuses_prefix_matched_session_on_followup_request():
         client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [
                     {"role": "user", "content": "hello"},
                     {"role": "assistant", "content": "ok"},
@@ -196,7 +272,7 @@ def test_chat_completions_rejects_tool_calls_not_advertised_in_request():
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Do something"}],
                 "tools": [
                     {
@@ -235,7 +311,7 @@ def test_chat_completions_streaming_returns_live_sse_for_plain_text():
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Say hello"}],
                 "stream": True,
             },
@@ -276,7 +352,7 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Read the readme"}],
                 "tools": [
                     {
@@ -326,7 +402,7 @@ def test_chat_completions_streaming_downgrades_unsupported_tool_calls_to_text():
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "messages": [{"role": "user", "content": "Do something"}],
                 "tools": [
                     {
@@ -360,7 +436,7 @@ def test_responses_endpoint_returns_response_object_for_string_input():
         response = client.post(
             "/v1/responses",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "input": "Say hello",
             },
         )
@@ -389,7 +465,7 @@ def test_responses_endpoint_returns_function_call_items():
         response = client.post(
             "/v1/responses",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "input": "Read the readme",
                 "tools": [
                     {
@@ -424,7 +500,7 @@ def test_responses_endpoint_rejects_unadvertised_tool_calls():
         response = client.post(
             "/v1/responses",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "input": "Do something",
             },
         )
@@ -457,7 +533,7 @@ def test_responses_endpoint_rejects_invalid_tools_payload():
     response = client.post(
         "/v1/responses",
         json={
-            "model": "claude-cli",
+            "model": "sonnet",
             "input": "Do something",
             "tools": [{"type": "function"}],
         },
@@ -474,7 +550,7 @@ def test_responses_endpoint_rejects_invalid_nested_function_payload():
     response = client.post(
         "/v1/responses",
         json={
-            "model": "claude-cli",
+            "model": "sonnet",
             "input": "Do something",
             "tools": [{"type": "function", "function": {}}],
         },
@@ -501,7 +577,7 @@ def test_responses_endpoint_streams_text_events():
             "POST",
             "/v1/responses",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "input": "Say hello",
                 "stream": True,
             },
@@ -542,7 +618,7 @@ def test_responses_endpoint_streams_function_call_events():
             "POST",
             "/v1/responses",
             json={
-                "model": "claude-cli",
+                "model": "sonnet",
                 "input": "Read the readme",
                 "tools": [
                     {

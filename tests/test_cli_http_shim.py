@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from hermes_shim_http.models import CliRunResult, ShimConfig
-from hermes_shim_http.prompting import build_cli_prompt
+from hermes_shim_http.prompting import build_cli_prompt, build_cli_system_prompt, build_cli_user_prompt
 from hermes_shim_http.runner import build_cli_command, run_cli_prompt, stream_cli_prompt
 from hermes_shim_http.session_cache import SessionCache
 
@@ -16,14 +16,8 @@ FAKE_CLI = REPO_ROOT / "tests" / "fake_cli.py"
 
 
 class TestPrompting:
-    def test_build_cli_prompt_includes_transcript_tools_and_native_tool_ban(self):
-        prompt = build_cli_prompt(
-            messages=[
-                {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "Check the repo."},
-                {"role": "tool", "content": "{\"ok\": true}"},
-            ],
-            model="claude-cli",
+    def test_build_cli_system_prompt_has_no_roleplay_triggers(self):
+        system_prompt = build_cli_system_prompt(
             tools=[
                 {
                     "type": "function",
@@ -37,13 +31,102 @@ class TestPrompting:
             tool_choice="auto",
         )
 
-        assert "Hermes requested model hint: claude-cli" in prompt
-        assert "Do NOT use any native CLI built-in tools" in prompt
-        assert "<tool_call>{...}</tool_call>" in prompt
-        assert "read_file" in prompt
-        assert "System:\nYou are helpful." in prompt
-        assert "User:\nCheck the repo." in prompt
-        assert "Tool:\n{\"ok\": true}" in prompt
+        assert "<tool_call>" in system_prompt
+        assert "read_file" in system_prompt
+        assert "Assistant:" not in system_prompt
+        assert "User:" not in system_prompt
+        assert "System:" not in system_prompt
+
+    def test_build_cli_system_prompt_compacts_verbose_tool_schemas(self):
+        system_prompt = build_cli_system_prompt(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path"},
+                                "options": {
+                                    "type": "object",
+                                    "properties": {
+                                        "offset": {"type": "integer"},
+                                        "limit": {"type": "integer"},
+                                    },
+                                    "required": ["offset"],
+                                },
+                            },
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ]
+        )
+
+        assert "read_file" in system_prompt
+        assert "path:string (required)" in system_prompt
+        assert "options:object{offset:integer (required), limit:integer}" in system_prompt
+        assert "additionalProperties" not in system_prompt
+        assert '"properties"' not in system_prompt
+
+    def test_build_cli_user_prompt_uses_xml_tags_for_roles(self):
+        prompt = build_cli_user_prompt(
+            messages=[
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Check the repo."},
+                {"role": "assistant", "content": "Sure."},
+                {"role": "tool", "content": "{\"ok\": true}"},
+            ]
+        )
+
+        assert "<system>\nYou are helpful.\n</system>" in prompt
+        assert "<user>\nCheck the repo.\n</user>" in prompt
+        assert "<assistant>\nSure.\n</assistant>" in prompt
+        assert "<tool>\n{\"ok\": true}\n</tool>" in prompt
+        assert "Assistant:" not in prompt
+        assert "User:" not in prompt
+
+    def test_build_cli_user_prompt_preserves_structured_tool_calls_and_tool_metadata(self):
+        prompt = build_cli_user_prompt(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "README body"},
+            ]
+        )
+
+        assert '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\\"path\\":\\"README.md\\"}"}}</tool_call>' in prompt
+        assert "[tool_call_id=call_1, name=read_file]" in prompt
+        assert "README body" in prompt
+
+    def test_build_cli_prompt_combines_system_and_transcript(self):
+        prompt = build_cli_prompt(
+            messages=[
+                {"role": "user", "content": "Hi"},
+            ],
+            model="sonnet",
+            tools=None,
+        )
+
+        assert "reasoning backend" in prompt
+        assert "Requested model: sonnet" in prompt
+        assert "<user>\nHi\n</user>" in prompt
+        assert "Assistant:" not in prompt
+
+
+_CLAUDE_APPEND_PROMPT = "Be concise and follow the user's instructions exactly."
 
 
 class TestRunner:
@@ -98,14 +181,25 @@ class TestRunner:
 
         cmd = build_cli_command(cfg, "hello")
 
-        assert cmd == ["claude", "-p"]
+        assert cmd == [
+            "claude",
+            "-p",
+            "--append-system-prompt",
+            _CLAUDE_APPEND_PROMPT,
+        ]
 
     def test_build_cli_command_uses_profile_defaults_for_supported_clis(self):
-        assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == ["claude", "-p"]
+        assert build_cli_command(ShimConfig(command="claude", args=[]), "hello") == [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt",
+            _CLAUDE_APPEND_PROMPT,
+        ]
         assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
         assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
 
-    def test_build_cli_command_includes_claude_session_resume_flags(self):
+    def test_build_cli_command_uses_append_only_for_new_claude_session(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
 
         cmd = build_cli_command(
@@ -118,6 +212,7 @@ class TestRunner:
         assert cmd == [
             "claude",
             "-p",
+            "--dangerously-skip-permissions",
             "--resume",
             "22222222-2222-2222-2222-222222222222",
             "--fork-session",
@@ -125,7 +220,49 @@ class TestRunner:
             "11111111-1111-1111-1111-111111111111",
         ]
 
-    def test_run_cli_prompt_returns_result(self):
+    def test_build_cli_command_uses_short_append_and_model_for_new_claude_session(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work", fallback_model="haiku")
+
+        cmd = build_cli_command(
+            cfg,
+            "hello",
+            system_prompt="Be terse.",
+            model="opus",
+        )
+
+        assert cmd == [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt",
+            _CLAUDE_APPEND_PROMPT,
+            "--model",
+            "opus",
+            "--fallback-model",
+            "haiku",
+        ]
+
+    def test_build_cli_command_ignores_non_meaningful_model_for_claude(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello", model="cli-http-shim")
+
+        assert cmd == [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt",
+            _CLAUDE_APPEND_PROMPT,
+        ]
+
+    def test_build_cli_command_prepends_system_prompt_for_non_claude_cli(self):
+        cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello", system_prompt="Be terse.")
+
+        assert cmd == ["codex", "exec", "Be terse.\n\nhello"]
+
+    def test_run_cli_prompt_sends_combined_prompt_via_stdin_for_claude(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
         completed = subprocess.CompletedProcess(
             args=["claude", "-p"],
@@ -135,18 +272,64 @@ class TestRunner:
         )
 
         with patch("hermes_shim_http.runner.subprocess.run", return_value=completed) as mock_run:
-            result = run_cli_prompt("hello", cfg)
+            result = run_cli_prompt("hello", cfg, system_prompt="Be terse.", model="sonnet")
 
         assert isinstance(result, CliRunResult)
         assert result.stdout == "done"
         assert result.stderr == ""
         assert result.exit_code == 0
         mock_run.assert_called_once_with(
-            ["claude", "-p"],
+            [
+                "claude",
+                "-p",
+                "--append-system-prompt",
+                _CLAUDE_APPEND_PROMPT,
+                "--model",
+                "sonnet",
+            ],
             cwd="/tmp/work",
             capture_output=True,
             text=True,
-            input="hello",
+            input="Be terse.\n\nhello",
+            timeout=12.0,
+            check=False,
+        )
+
+    def test_run_cli_prompt_omits_large_system_prompt_from_resumed_claude_stdin(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        completed = subprocess.CompletedProcess(
+            args=["claude", "-p"],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+
+        with patch("hermes_shim_http.runner.subprocess.run", return_value=completed) as mock_run:
+            run_cli_prompt(
+                "<user>\ncontinue\n</user>",
+                cfg,
+                system_prompt="VERY LONG SYSTEM",
+                model="sonnet",
+                session_id="11111111-1111-1111-1111-111111111111",
+                resume_session_id="22222222-2222-2222-2222-222222222222",
+            )
+
+        mock_run.assert_called_once_with(
+            [
+                "claude",
+                "-p",
+                "--model",
+                "sonnet",
+                "--resume",
+                "22222222-2222-2222-2222-222222222222",
+                "--fork-session",
+                "--session-id",
+                "11111111-1111-1111-1111-111111111111",
+            ],
+            cwd="/tmp/work",
+            capture_output=True,
+            text=True,
+            input="<user>\ncontinue\n</user>",
             timeout=12.0,
             check=False,
         )
@@ -194,11 +377,24 @@ class TestRunner:
             def close(self) -> None:
                 return None
 
+        class _FakeStdin:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def write(self, text: str) -> None:
+                self.value += text
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
         class _FakeProcess:
             def __init__(self) -> None:
                 self.stdout = _FakeStream()
                 self.stderr = _FakeStream()
-                self.stdin = None
+                self.stdin = _FakeStdin()
 
             def wait(self, timeout=None):
                 return 0
@@ -209,12 +405,92 @@ class TestRunner:
             def kill(self):
                 return None
 
-        with patch("hermes_shim_http.runner.subprocess.Popen", return_value=_FakeProcess()) as mock_popen:
-            events = list(stream_cli_prompt("hello", cfg))
+        fake_process = _FakeProcess()
+        with patch("hermes_shim_http.runner.subprocess.Popen", return_value=fake_process) as mock_popen:
+            events = list(stream_cli_prompt("hello", cfg, system_prompt="Be terse."))
 
         assert events == []
+        assert fake_process.stdin.value == "Be terse.\n\nhello"
         mock_popen.assert_called_once_with(
-            ["claude", "-p"],
+            [
+                "claude",
+                "-p",
+                "--append-system-prompt",
+                _CLAUDE_APPEND_PROMPT,
+            ],
+            cwd="/tmp/work",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=0,
+        )
+
+    def test_stream_cli_prompt_omits_large_system_prompt_from_resumed_claude_stdin(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+
+        class _FakeStream:
+            def read(self, _size: int = 1) -> str:
+                return ""
+
+            def close(self) -> None:
+                return None
+
+        class _FakeStdin:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def write(self, text: str) -> None:
+                self.value += text
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = _FakeStream()
+                self.stderr = _FakeStream()
+                self.stdin = _FakeStdin()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                return None
+
+        fake_process = _FakeProcess()
+        with patch("hermes_shim_http.runner.subprocess.Popen", return_value=fake_process) as mock_popen:
+            events = list(
+                stream_cli_prompt(
+                    "<user>\ncontinue\n</user>",
+                    cfg,
+                    system_prompt="VERY LONG SYSTEM",
+                    model="sonnet",
+                    session_id="11111111-1111-1111-1111-111111111111",
+                    resume_session_id="22222222-2222-2222-2222-222222222222",
+                )
+            )
+
+        assert events == []
+        assert fake_process.stdin.value == "<user>\ncontinue\n</user>"
+        mock_popen.assert_called_once_with(
+            [
+                "claude",
+                "-p",
+                "--model",
+                "sonnet",
+                "--resume",
+                "22222222-2222-2222-2222-222222222222",
+                "--fork-session",
+                "--session-id",
+                "11111111-1111-1111-1111-111111111111",
+            ],
             cwd="/tmp/work",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -270,7 +546,7 @@ class TestSessionCache:
         cache = SessionCache()
         first = cache.plan_request(
             messages=[{"role": "user", "content": "hello"}],
-            model="claude-cli",
+            model="sonnet",
             tools=None,
             tool_choice=None,
         )
@@ -281,11 +557,149 @@ class TestSessionCache:
                 {"role": "assistant", "content": "hi"},
                 {"role": "user", "content": "continue"},
             ],
-            model="claude-cli",
+            model="sonnet",
             tools=None,
             tool_choice=None,
         )
 
         assert second.resume_session_id == first.session_id
-        assert second.prompt_text == "User:\ncontinue"
+        assert second.prompt_text == "<user>\ncontinue\n</user>"
         assert second.prefix_message_count == 2
+        assert second.system_prompt_text is not None
+        assert "reasoning backend" in second.system_prompt_text
+
+    def test_plan_request_without_match_returns_full_user_prompt(self):
+        cache = SessionCache()
+
+        plan = cache.plan_request(
+            messages=[{"role": "user", "content": "hello"}],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+
+        assert plan.resume_session_id is None
+        assert plan.prompt_text == "<user>\nhello\n</user>"
+        assert plan.system_prompt_text is not None
+        assert "reasoning backend" in plan.system_prompt_text
+
+    def test_plan_request_normalizes_assistant_content_for_resume_match(self):
+        cache = SessionCache()
+        first = cache.plan_request(
+            messages=[
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+        cache.record_success(first, assistant_messages=[{"role": "assistant", "content": "hi there"}])
+
+        second = cache.plan_request(
+            messages=[
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": " hi there\n"}]},
+                {"role": "user", "content": "continue"},
+            ],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+
+        assert second.resume_session_id == first.session_id
+        assert second.prefix_message_count == 3
+        assert second.prompt_text == "<user>\ncontinue\n</user>"
+
+    def test_plan_request_does_not_resume_from_partial_prefix_after_divergence(self):
+        cache = SessionCache()
+        first = cache.plan_request(
+            messages=[{"role": "user", "content": "hello"}],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+        cache.record_success(
+            first,
+            assistant_messages=[
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "old branch"},
+                {"role": "assistant", "content": "old answer"},
+            ],
+        )
+
+        second = cache.plan_request(
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "new branch"},
+            ],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+
+        assert second.resume_session_id is None
+        assert second.prefix_message_count == 0
+        assert second.prompt_text == "<user>\nhello\n</user>\n\n<assistant>\nhi\n</assistant>\n\n<user>\nnew branch\n</user>"
+
+    def test_plan_request_distinguishes_assistant_tool_calls_between_branches(self):
+        cache = SessionCache()
+        first = cache.plan_request(
+            messages=[{"role": "user", "content": "read file"}],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+        cache.record_success(
+            first,
+            assistant_messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_readme",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                        }
+                    ],
+                }
+            ],
+        )
+
+        second = cache.plan_request(
+            messages=[
+                {"role": "user", "content": "read file"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_license",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"LICENSE"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_license", "content": "MIT"},
+            ],
+            model="sonnet",
+            tools=None,
+            tool_choice=None,
+        )
+
+        assert second.resume_session_id is None
+        assert second.prefix_message_count == 0
+
+    def test_matching_prefix_length_reports_mismatch_details(self):
+        prefix_len, mismatch = SessionCache._matching_prefix_length(
+            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "one"}],
+            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "two"}],
+        )
+
+        assert prefix_len == 1
+        assert mismatch is not None
+        assert mismatch["reason"] == "message_mismatch"
+        assert mismatch["index"] == 1
