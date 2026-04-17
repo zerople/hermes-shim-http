@@ -4,6 +4,7 @@ import json
 from typing import Any, Iterable
 
 from .models import ToolDefinition
+from .token_usage import DEFAULT_CONTEXT_LIMIT, estimate_context_tokens
 
 
 def _render_content(content: Any) -> str:
@@ -55,9 +56,53 @@ def _render_transcript(messages: list[dict[str, Any]] | list[Any]) -> list[str]:
             "tool": "Tool",
         }.get(role, "Context")
         rendered = _render_content(message.get("content"))
+        tool_calls = message.get("tool_calls")
         if rendered:
             transcript.append(f"{label}:\n{rendered}")
+        elif tool_calls:
+            transcript.append(f"{label} tool calls:\n{json.dumps(tool_calls, ensure_ascii=False)}")
     return transcript
+
+
+def compact_messages(
+    *,
+    messages: list[dict[str, Any]] | list[Any],
+    mode: str,
+    threshold: float,
+    context_limit: int = DEFAULT_CONTEXT_LIMIT,
+    force: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    normalized = [(message if isinstance(message, dict) else message.model_dump()) for message in messages]
+    if mode == "off":
+        return normalized, False
+
+    used = estimate_context_tokens(normalized)
+    if not force and used <= max(1, int(context_limit * threshold)):
+        return normalized, False
+
+    system_messages = [message for message in normalized if str(message.get("role", "")).lower() == "system"]
+    conversation_messages = [message for message in normalized if str(message.get("role", "")).lower() != "system"]
+    if len(conversation_messages) <= 2:
+        return normalized, False
+
+    if mode == "window":
+        window = conversation_messages[-3:]
+        compacted = [*system_messages, *window]
+        return compacted, compacted != normalized
+
+    summary_source = conversation_messages[:-3]
+    tail = conversation_messages[-3:]
+    summary_text = " | ".join(_render_content(message.get("content")) for message in summary_source if _render_content(message.get("content")))
+    summary_text = summary_text[:280] or "Earlier conversation omitted."
+    compacted = [
+        *system_messages,
+        {
+            "role": "system",
+            "content": f"Summary of earlier conversation: {summary_text}",
+        },
+        *tail,
+    ]
+    return compacted, compacted != normalized
 
 
 def build_cli_resume_delta_prompt(*, messages: list[dict[str, Any]] | list[Any]) -> str:

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+def _default_cache_path() -> str:
+    return str(Path("~/.cache/hermes-shim-http/sessions.sqlite").expanduser())
 
 
 class ToolFunction(BaseModel):
@@ -21,6 +26,7 @@ class ChatMessage(BaseModel):
     content: Any = ""
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatCompletionsRequest(BaseModel):
@@ -57,3 +63,10 @@ class ShimConfig(BaseModel):
     models: List[str] = Field(default_factory=lambda: ["claude-cli"])
     provider_label: str = "cli-http-shim"
     cli_profile: Literal["auto", "claude", "codex", "opencode", "generic"] = "auto"
+    cache_path: str = Field(default_factory=_default_cache_path)
+    cache_ttl_seconds: float = 3600.0
+    cache_max_entries: int = 256
+    compaction: Literal["off", "summarize", "window"] = "off"
+    compaction_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    log_level: Literal["info", "debug"] = "info"
+    log_format: Literal["text", "json"] = "text"

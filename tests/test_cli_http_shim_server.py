@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -18,6 +19,18 @@ def _client():
         )
     )
     return TestClient(app)
+
+
+def _client_with_config(**overrides):
+    config = ShimConfig(
+        command="claude",
+        args=["-p"],
+        cwd="/tmp",
+        timeout=30.0,
+        models=["claude-cli"],
+        **overrides,
+    )
+    return TestClient(create_app(config))
 
 
 def test_models_endpoint_returns_configured_models():
@@ -422,6 +435,22 @@ def test_responses_endpoint_rejects_unadvertised_tool_calls():
     assert "unsupported tool call(s): browser_navigate" in payload["output"][0]["content"][0]["text"]
 
 
+def test_responses_endpoint_rejects_missing_input_with_openai_style_error():
+    client = _client()
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "claude-cli",
+        },
+    )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert "input" in payload["error"]["message"].lower()
+
+
 def test_responses_endpoint_rejects_invalid_tools_payload():
     client = _client()
 
@@ -534,3 +563,192 @@ def test_responses_endpoint_streams_function_call_events():
     assert '"name": "read_file"' in body
     assert "response.completed" in body
     assert "data: [DONE]" in body
+
+
+def test_debug_stats_endpoint_returns_observability_fields():
+    client = _client()
+
+    response = client.get("/v1/debug/stats")
+
+    assert response.status_code == 200
+    payload = response.json()
+    for key in [
+        "cache_size",
+        "hit_rate",
+        "avg_latency_ms",
+        "active_sessions",
+        "uptime_s",
+        "avg_context_tokens_used",
+        "max_context_tokens_used",
+    ]:
+        assert key in payload
+
+
+def test_debug_stats_updates_after_requests_and_debug_quota_is_unknown():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="Hello from Claude", stderr="", exit_code=0, duration_ms=25),
+    ):
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+    stats = client.get("/v1/debug/stats")
+    quota = client.get("/v1/debug/quota")
+
+    assert stats.status_code == 200
+    assert stats.json()["cache_size"] >= 1
+    assert stats.json()["active_sessions"] >= 1
+    assert stats.json()["avg_latency_ms"] >= 25
+    assert quota.json() == {"status": "unknown"}
+
+
+def test_chat_completions_include_context_and_response_token_metadata():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="Hello from Claude", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "Say hello with metadata"}]},
+        )
+
+    payload = response.json()
+    assert payload["usage"]["context_tokens_used"] > 0
+    assert payload["usage"]["context_tokens_limit"] >= payload["usage"]["context_tokens_used"]
+    assert payload["usage"]["response_tokens"] > 0
+
+
+def test_chat_completions_streaming_finishes_with_token_metadata():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.stream_cli_prompt",
+        return_value=iter([CliStreamEvent(kind="text", text="Hello")]),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "Say hello"}], "stream": True},
+        ) as response:
+            body = response.read().decode()
+
+    assert '"context_tokens_used":' in body
+    assert '"response_tokens":' in body
+
+
+def test_chat_completions_sets_compaction_header_when_threshold_triggers():
+    client = _client_with_config(compaction="window", compaction_threshold=0.01)
+    messages = [{"role": "user", "content": "very long message " * 80} for _ in range(6)]
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="compacted", stderr="", exit_code=0, duration_ms=10),
+    ):
+        response = client.post("/v1/chat/completions", json={"model": "claude-cli", "messages": messages})
+
+    assert response.headers["X-Context-Compacted"] == "true"
+
+
+def test_slash_commands_are_handled_without_invoking_cli():
+    client = _client_with_config(compaction="off", compaction_threshold=0.9)
+
+    with patch("hermes_shim_http.server.run_cli_prompt") as mock_run:
+        clear_response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "/clear"}]},
+        )
+        compact_response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-cli",
+                "messages": [
+                    {"role": "user", "content": "older context " * 60},
+                    {"role": "assistant", "content": "ack"},
+                    {"role": "user", "content": "/compact"},
+                ],
+            },
+        )
+        stats_response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "/stats"}]},
+        )
+
+    assert mock_run.call_count == 0
+    assert "cleared" in clear_response.json()["choices"][0]["message"]["content"].lower()
+    assert "compaction" in compact_response.json()["choices"][0]["message"]["content"].lower()
+    assert compact_response.headers["X-Context-Compacted"] == "true"
+    assert client.get("/v1/debug/stats").json()["compactions"] >= 1
+    assert "cache" in stats_response.json()["choices"][0]["message"]["content"].lower()
+
+
+def test_model_slash_command_overrides_response_model_without_invoking_cli():
+    client = _client()
+
+    with patch("hermes_shim_http.server.run_cli_prompt") as mock_run:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "/model sonnet"}]},
+        )
+
+    assert mock_run.call_count == 0
+    assert response.json()["model"] == "sonnet"
+
+
+def test_responses_slash_compact_is_handled_locally_without_invoking_cli():
+    client = _client()
+
+    with patch("hermes_shim_http.server.run_cli_prompt") as mock_run:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "claude-cli", "input": "/compact"},
+        )
+
+    assert mock_run.call_count == 0
+    assert response.headers["X-Context-Compacted"] == "true"
+    assert "compaction" in response.json()["output"][0]["content"][0]["text"].lower()
+
+
+def test_streaming_keepalive_emits_ping_comments_during_idle_periods(monkeypatch):
+    client = _client()
+
+    def slow_events():
+        yield CliStreamEvent(kind="text", text="hello")
+        import time
+
+        time.sleep(0.03)
+        yield CliStreamEvent(kind="text", text=" world")
+
+    monkeypatch.setattr("hermes_shim_http.server.KEEPALIVE_INTERVAL_SECONDS", 0.01, raising=False)
+    with patch("hermes_shim_http.server.stream_cli_prompt", return_value=slow_events()):
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "Say hello"}], "stream": True},
+        ) as response:
+            body = response.read().decode()
+
+    assert ": ping\n\n" in body
+
+
+def test_structured_logging_emits_request_ids_and_cache_events(caplog):
+    client = _client_with_config(log_level="debug", log_format="json")
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_shim_http"):
+        with patch(
+            "hermes_shim_http.server.run_cli_prompt",
+            return_value=CliRunResult(stdout="Hello from Claude", stderr="", exit_code=0, duration_ms=10),
+        ):
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "claude-cli", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+    assert any('"event": "cache_miss"' in record.message for record in caplog.records)
+    assert any('"event": "spawn"' in record.message for record in caplog.records)
+    assert all('"request_id":' in record.message for record in caplog.records if '"event":' in record.message)
