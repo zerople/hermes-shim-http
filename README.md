@@ -119,14 +119,46 @@ npx @zerople/hermes-shim-http \
   --model claude-cli
 ```
 
-Then point Hermes to the local provider:
+Then point Hermes to the local provider.
+
+### If you are currently using `openai-codex`
+
+A lot of users already have a `config.yaml` that looks something like this:
+
+```yaml
+model:
+  base_url: https://chatgpt.com/backend-api/codex
+  context_length: 1000000
+  default: gpt-5.4
+  provider: openai-codex
+  api_key: no-key-required
+
+providers: {}
+fallback_providers: []
+```
+
+You do **not** need to delete that from memory and figure everything out again. The easiest way is:
+
+1. keep a copy of your old config
+2. replace the active `model:` block with one of the shim examples below
+3. add a `custom_providers:` section
+
+If you want, you can even keep your old provider as a commented backup in the same file.
+
+### Option A: use the shim via `chat_completions`
+
+This is usually the easiest place to start.
 
 ```yaml
 model:
   default: claude-cli
   provider: custom
   base_url: http://127.0.0.1:8765/v1
+  api_key: no-key-required
   api_mode: chat_completions
+  context_length: 1000000
+
+providers: {}
 
 custom_providers:
   - name: claude-shim
@@ -134,18 +166,77 @@ custom_providers:
     api_key: no-key-required
     api_mode: chat_completions
     model: claude-cli
+
+fallback_providers: []
 ```
 
-If you want to use the Responses API style instead:
+### Option B: use the shim via `codex_responses`
+
+Use this if you specifically want Hermes to talk to the shim through `/v1/responses`.
 
 ```yaml
+model:
+  default: claude-cli
+  provider: custom
+  base_url: http://127.0.0.1:8765/v1
+  api_key: no-key-required
+  api_mode: codex_responses
+  context_length: 1000000
+
+providers: {}
+
 custom_providers:
   - name: claude-shim-responses
     base_url: http://127.0.0.1:8765/v1
     api_key: no-key-required
     api_mode: codex_responses
     model: claude-cli
+
+fallback_providers: []
 ```
+
+### Example with the old config kept as a backup
+
+This can make editing less stressful for users who want a clear before/after reference:
+
+```yaml
+# old setup
+# model:
+#   base_url: https://chatgpt.com/backend-api/codex
+#   context_length: 1000000
+#   default: gpt-5.4
+#   provider: openai-codex
+#   api_key: no-key-required
+
+model:
+  default: claude-cli
+  provider: custom
+  base_url: http://127.0.0.1:8765/v1
+  api_key: no-key-required
+  api_mode: codex_responses
+  context_length: 1000000
+
+providers: {}
+
+custom_providers:
+  - name: claude-shim-responses
+    base_url: http://127.0.0.1:8765/v1
+    api_key: no-key-required
+    api_mode: codex_responses
+    model: claude-cli
+
+fallback_providers: []
+```
+
+### Which one should you use?
+
+- use `chat_completions` if you want the simplest, most familiar setup
+- use `codex_responses` if you want Hermes to call the shim's `/v1/responses` endpoint
+
+A practical rule of thumb:
+
+- start with `chat_completions`
+- switch to `codex_responses` only if you specifically want the Responses-style flow
 
 ---
 
