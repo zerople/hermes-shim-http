@@ -72,7 +72,7 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/api/tags").json()["models"][0]["name"] == "claude-cli"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
-    assert client.get("/version").json()["version"] == "0.1.2"
+    assert client.get("/version").json()["version"] == "0.1.3"
 
 
 def test_chat_completions_returns_plain_text():
