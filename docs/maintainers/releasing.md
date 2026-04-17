@@ -19,9 +19,13 @@ On first run, the Node launcher bootstraps a cached Python virtual environment a
 Before the first public release, configure:
 
 1. npm package ownership for the `@zerople` scope
-2. GitHub Actions secret:
-   - `NPM_TOKEN`
-3. recommended repository settings:
+2. npm trusted publishing for this GitHub repository
+   - add the GitHub repo/workflow as a trusted publisher in npm
+   - this is the recommended path because it avoids long-lived publish tokens
+3. optional fallback only if you cannot use trusted publishing:
+   - GitHub Actions secret `NPM_TOKEN`
+   - use an npm automation token or a granular token with bypass 2FA enabled
+4. recommended repository settings:
    - protect `main`
    - restrict who can create release tags if needed
 
@@ -72,6 +76,8 @@ git push origin v0.1.0
 
 That tag push triggers `.github/workflows/publish-npm.yml`.
 
+The workflow is configured for npm trusted publishing via GitHub OIDC (`id-token: write` + `npm publish --provenance`). If trusted publishing is not configured yet on npm, the release job will fail until you add the trusted publisher or temporarily switch back to token-based publishing.
+
 ### Why this is the recommended default
 
 - first push creates the repo history cleanly
@@ -85,6 +91,8 @@ If GitHub Actions is unavailable, manual fallback is:
 npm publish --access public
 ```
 
+If your npm account enforces 2FA for publish, local/manual publish also needs either an interactive OTP flow or an allowed automation/granular token with the right publish permissions.
+
 ## Workflow summary
 
 - CI: `.github/workflows/ci.yml`
@@ -94,6 +102,7 @@ Current publish behavior:
 
 - package name: `@zerople/hermes-shim-http`
 - package access: `public`
+- publish method: npm trusted publishing (recommended)
 - publish triggers:
   - tag push matching `v*`
   - manual workflow dispatch
