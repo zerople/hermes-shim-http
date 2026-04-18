@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import errno
 import os
 import queue
@@ -15,6 +16,12 @@ from .telemetry import emit_event
 
 _DEFAULT_CHUNK_SIZE = 4096
 _CLAUDE_APPEND_SYSTEM_PROMPT = "Be concise and follow the user's instructions exactly."
+_HEARTBEAT_CHAR = "\u200b"
+_HEARTBEAT_WRAPPER = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "bin",
+    "heartbeat-wrap.py",
+)
 
 
 def _command_basename(command: str) -> str:
@@ -133,6 +140,16 @@ def build_cli_command(
     return [*base, combined]
 
 
+def _heartbeat_prefix(config: ShimConfig) -> list[str]:
+    if not config.heartbeat_wrap:
+        return []
+    return ["python3", _HEARTBEAT_WRAPPER, "-i", str(config.heartbeat_interval), "--"]
+
+
+def _strip_heartbeat(text: str) -> str:
+    return text.replace(_HEARTBEAT_CHAR, "") if _HEARTBEAT_CHAR in text else text
+
+
 def _translate_spawn_oserror(exc: OSError, *, command: str) -> RuntimeError:
     if exc.errno == errno.E2BIG:
         return RuntimeError(
@@ -196,19 +213,19 @@ def _drain_cli_process(
         "cwd": config.cwd,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
         "bufsize": 0,
     }
     if stdin_prompt is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
+    spawn_command = _heartbeat_prefix(config) + command
     try:
-        process = subprocess.Popen(command, **popen_kwargs)
+        process = subprocess.Popen(spawn_command, **popen_kwargs)
     except OSError as exc:
         raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     if stdin_prompt is not None and process.stdin is not None:
         try:
-            process.stdin.write(stdin_prompt)
+            process.stdin.write(stdin_prompt.encode("utf-8"))
             process.stdin.flush()
         finally:
             process.stdin.close()
@@ -242,7 +259,9 @@ def _drain_cli_process(
                 else:
                     _, chunk = item
                     last_activity = time.time()
-                    stdout_chunks.append(chunk)
+                    cleaned = _strip_heartbeat(chunk)
+                    if cleaned:
+                        stdout_chunks.append(cleaned)
 
             while True:
                 try:
@@ -255,7 +274,9 @@ def _drain_cli_process(
                     continue
                 _, chunk = item
                 last_activity = time.time()
-                stderr_chunks.append(chunk)
+                cleaned = _strip_heartbeat(chunk)
+                if cleaned:
+                    stderr_chunks.append(cleaned)
 
             if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
                 stderr_done = True
@@ -286,12 +307,23 @@ def _pump_stream(
     *,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
 ) -> None:
+    read = stream.read1 if hasattr(stream, "read1") else stream.read
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
-            chunk = stream.read(chunk_size)
+            chunk = read(chunk_size)
             if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    sink.put((stream_name, tail))
                 break
-            sink.put((stream_name, chunk))
+            if isinstance(chunk, bytes):
+                text = decoder.decode(chunk)
+                if not text:
+                    continue
+            else:
+                text = chunk
+            sink.put((stream_name, text))
     finally:
         try:
             stream.close()
@@ -331,21 +363,21 @@ def stream_cli_prompt(
         "cwd": config.cwd,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
         "bufsize": 0,
     }
     if _pipes_prompt_via_stdin(config):
         popen_kwargs["stdin"] = subprocess.PIPE
+    spawn_command = _heartbeat_prefix(config) + command
     try:
         process = subprocess.Popen(
-            command,
+            spawn_command,
             **popen_kwargs,
         )
     except OSError as exc:
         raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     if _pipes_prompt_via_stdin(config) and process.stdin is not None:
-        process.stdin.write(stdin_prompt)
+        process.stdin.write(stdin_prompt.encode("utf-8"))
         process.stdin.flush()
         process.stdin.close()
     if process.stdout is None or process.stderr is None:
@@ -386,9 +418,11 @@ def stream_cli_prompt(
                 else:
                     _, chunk = item
                     last_activity = time.time()
-                    stdout_chunks.append(chunk)
-                    for event in parser.feed(chunk):
-                        yield event
+                    cleaned = _strip_heartbeat(chunk)
+                    if cleaned:
+                        stdout_chunks.append(cleaned)
+                        for event in parser.feed(cleaned):
+                            yield event
 
             while True:
                 try:
@@ -401,7 +435,9 @@ def stream_cli_prompt(
                     continue
                 _, chunk = item
                 last_activity = time.time()
-                stderr_chunks.append(chunk)
+                cleaned = _strip_heartbeat(chunk)
+                if cleaned:
+                    stderr_chunks.append(cleaned)
 
             if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
                 stderr_done = True

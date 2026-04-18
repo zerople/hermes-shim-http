@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from hashlib import sha256
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -29,6 +29,47 @@ from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_tok
 SILENT_HEADER = "X-Shim-Silent"
 
 KEEPALIVE_INTERVAL_SECONDS = 10.0
+
+_HTTP_HEARTBEAT_BYTE = b" "
+
+
+def _streaming_json_with_heartbeat(
+    run_fn: Callable[[], dict[str, Any]],
+    *,
+    interval: float,
+    on_error: Callable[[BaseException], dict[str, Any]],
+) -> Iterator[bytes]:
+    """Run ``run_fn`` on a background thread, emit whitespace every ``interval``s
+    while it runs, then yield the final JSON body.
+
+    JSON (RFC 8259) allows arbitrary leading whitespace, so callers parsing the
+    concatenated stream as JSON still get a valid document. The heartbeat bytes
+    keep Hermes→shim HTTP connections alive through long CLI runs.
+
+    If ``run_fn`` raises, ``on_error`` builds an OpenAI-style error body. The
+    HTTP status is 200 (already committed before we knew the outcome); callers
+    must inspect the ``error`` field.
+    """
+    outcome: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            outcome["body"] = run_fn()
+        except BaseException as exc:  # noqa: BLE001 — surface via JSON body
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    while not done.wait(interval):
+        yield _HTTP_HEARTBEAT_BYTE
+
+    if "error" in outcome:
+        body = on_error(outcome["error"])
+    else:
+        body = outcome["body"]
+    yield json.dumps(body).encode("utf-8")
 
 
 def _is_silent_candidate(accumulated: str, sentinel: str) -> bool:
@@ -895,9 +936,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **headers},
             )
-        try:
-            started = time.time()
-            emit_log(logger, event="spawn", request_id=request_id, model=request.model, stream=False)
+        started = time.time()
+        emit_log(logger, event="spawn", request_id=request_id, model=request.model, stream=False)
+
+        def _run_chat() -> dict[str, Any]:
             result = run_cli_prompt(
                 session_plan.prompt_text,
                 cfg,
@@ -913,7 +955,22 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             if parsed.silent:
                 emit_log(logger, event="silent", request_id=request_id, model=request.model)
             emit_log(logger, event="stream_end", request_id=request_id, model=request.model)
-            return JSONResponse(content=_chat_response(model=request.model, parsed=parsed, usage=usage), headers=_silent_headers(parsed, headers))
+            nonlocal headers
+            headers = _silent_headers(parsed, headers)
+            return _chat_response(model=request.model, parsed=parsed, usage=usage)
+
+        def _on_chat_error(exc: BaseException) -> dict[str, Any]:
+            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
+            return {"error": {"message": str(exc), "type": "shim_error"}}
+
+        if cfg.http_heartbeat_interval > 0:
+            return StreamingResponse(
+                _streaming_json_with_heartbeat(_run_chat, interval=cfg.http_heartbeat_interval, on_error=_on_chat_error),
+                media_type="application/json",
+                headers=headers,
+            )
+        try:
+            return JSONResponse(content=_run_chat(), headers=headers)
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -965,9 +1022,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **headers},
             )
-        try:
-            started = time.time()
-            emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
+        started = time.time()
+        emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
+
+        def _run_responses() -> dict[str, Any]:
             result = run_cli_prompt(prompt, cfg, model=model)
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
@@ -976,7 +1034,22 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             if parsed.silent:
                 emit_log(logger, event="silent", request_id=request_id, model=model)
             emit_log(logger, event="stream_end", request_id=request_id, model=model)
-            return JSONResponse(content=_responses_json_response(model=model, parsed=parsed, usage=usage, output_items=_responses_output_items_from_events(ordered_events)), headers=_silent_headers(parsed, headers))
+            nonlocal headers
+            headers = _silent_headers(parsed, headers)
+            return _responses_json_response(model=model, parsed=parsed, usage=usage, output_items=_responses_output_items_from_events(ordered_events))
+
+        def _on_responses_error(exc: BaseException) -> dict[str, Any]:
+            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
+            return {"error": {"message": str(exc), "type": "shim_error"}}
+
+        if cfg.http_heartbeat_interval > 0:
+            return StreamingResponse(
+                _streaming_json_with_heartbeat(_run_responses, interval=cfg.http_heartbeat_interval, on_error=_on_responses_error),
+                media_type="application/json",
+                headers=headers,
+            )
+        try:
+            return JSONResponse(content=_run_responses(), headers=headers)
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1001,6 +1074,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compaction-threshold", type=float, default=0.9)
     parser.add_argument("--log-level", choices=["info", "debug"], default="info")
     parser.add_argument("--log-format", choices=["text", "json"], default="text")
+    parser.add_argument("--heartbeat-wrap", dest="heartbeat_wrap", action=argparse.BooleanOptionalAction, default=True,
+                        help="Wrap child CLI with heartbeat-wrap.py so stdout silence during long runs doesn't trip the idle timeout (default: on).")
+    parser.add_argument("--heartbeat-interval", dest="heartbeat_interval", type=float, default=60.0,
+                        help="Seconds between child-CLI heartbeat emissions when --heartbeat-wrap is on (default: 60.0).")
+    parser.add_argument("--http-heartbeat-interval", dest="http_heartbeat_interval", type=float, default=30.0,
+                        help="Seconds between whitespace heartbeat bytes on non-streaming HTTP responses. 0 disables (default: 30.0).")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
 
@@ -1025,6 +1104,9 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "compaction_threshold": config.compaction_threshold,
         "log_level": config.log_level,
         "log_format": config.log_format,
+        "heartbeat_wrap": config.heartbeat_wrap,
+        "heartbeat_interval": config.heartbeat_interval,
+        "http_heartbeat_interval": config.http_heartbeat_interval,
     }
 
 
@@ -1049,6 +1131,9 @@ def main() -> None:
         compaction_threshold=ns.compaction_threshold,
         log_level=ns.log_level,
         log_format=ns.log_format,
+        heartbeat_wrap=ns.heartbeat_wrap,
+        heartbeat_interval=ns.heartbeat_interval,
+        http_heartbeat_interval=ns.http_heartbeat_interval,
     )
     import uvicorn
 
