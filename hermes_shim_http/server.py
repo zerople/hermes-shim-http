@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from . import __version__
 from .logging_utils import configure_logger, emit_log
 from .inflight import InFlightRegistry
+from .single_child import ChildLockBusy
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser
 from .prompting import build_cli_prompt, compact_messages
@@ -895,6 +896,14 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     app.state.in_flight = InFlightRegistry()
     logger = configure_logger(log_level=cfg.log_level, log_format=cfg.log_format, logger_name=f"hermes_shim_http.{id(app)}")
 
+    @app.exception_handler(ChildLockBusy)
+    async def _child_lock_busy_handler(request: Request, exc: ChildLockBusy) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"message": str(exc), "type": "child_lock_busy", "code": "child_lock_busy"}},
+            headers={"Retry-After": "5"},
+        )
+
     def _context_window_for(model: str) -> int:
         profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
         name = (model or "").lower()
@@ -1237,6 +1246,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Wrap child CLI with heartbeat-wrap.py so stdout silence during long runs doesn't trip the idle timeout (default: on).")
     parser.add_argument("--heartbeat-interval", dest="heartbeat_interval", type=float, default=60.0,
                         help="Seconds between child-CLI heartbeat emissions when --heartbeat-wrap is on (default: 60.0).")
+    parser.add_argument("--single-child-lock", dest="single_child_lock", action=argparse.BooleanOptionalAction, default=True,
+        help="Enforce single-instance child-spawn lock (default: enabled) to prevent phantom-session races.")
+    parser.add_argument("--single-child-lock-path", dest="single_child_lock_path", default=None,
+        help="Path to the single-child lock file (default: /tmp/hermes-shim-http-<port>.child.lock).")
     parser.add_argument("--http-heartbeat-interval", dest="http_heartbeat_interval", type=float, default=30.0,
                         help="Seconds between whitespace heartbeat bytes on non-streaming HTTP responses. 0 disables (default: 30.0).")
     parser.add_argument("args", nargs=argparse.REMAINDER)
@@ -1266,6 +1279,7 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "heartbeat_wrap": config.heartbeat_wrap,
         "heartbeat_interval": config.heartbeat_interval,
         "http_heartbeat_interval": config.http_heartbeat_interval,
+        "single_child_lock_path": config.single_child_lock_path,
     }
 
 
@@ -1293,6 +1307,11 @@ def main() -> None:
         heartbeat_wrap=ns.heartbeat_wrap,
         heartbeat_interval=ns.heartbeat_interval,
         http_heartbeat_interval=ns.http_heartbeat_interval,
+        single_child_lock_path=(
+            (ns.single_child_lock_path or f"/tmp/hermes-shim-http-{ns.port}.child.lock")
+            if ns.single_child_lock
+            else None
+        ),
     )
     import uvicorn
 

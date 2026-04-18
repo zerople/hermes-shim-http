@@ -16,6 +16,7 @@ from .parsing import (
     parse_claude_stream_json,
     parse_cli_output,
 )
+from .single_child import ChildLockBusy, acquire_single_child_lock
 from .telemetry import emit_event
 
 
@@ -241,6 +242,16 @@ def _drain_cli_process(
     config: ShimConfig,
     stdin_prompt: str | None,
 ) -> tuple[str, str, int]:
+    with acquire_single_child_lock(config.single_child_lock_path or ""):
+        return _drain_cli_process_inner(command, config=config, stdin_prompt=stdin_prompt)
+
+
+def _drain_cli_process_inner(
+    command: List[str],
+    *,
+    config: ShimConfig,
+    stdin_prompt: str | None,
+) -> tuple[str, str, int]:
     popen_kwargs = {
         "cwd": config.cwd,
         "stdout": subprocess.PIPE,
@@ -391,6 +402,26 @@ def _pump_stream(
 
 
 def stream_cli_prompt(
+    prompt_text: str,
+    config: ShimConfig,
+    *,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
+) -> Iterator[CliStreamEvent]:
+    with acquire_single_child_lock(config.single_child_lock_path or ""):
+        yield from _stream_cli_prompt_inner(
+            prompt_text,
+            config,
+            session_id=session_id,
+            resume_session_id=resume_session_id,
+            system_prompt=system_prompt,
+            model=model,
+        )
+
+
+def _stream_cli_prompt_inner(
     prompt_text: str,
     config: ShimConfig,
     *,
