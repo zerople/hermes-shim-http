@@ -17,12 +17,14 @@ def _client():
             cwd="/tmp",
             timeout=30.0,
             models=["sonnet"],
+            http_heartbeat_interval=0,
         )
     )
     return TestClient(app)
 
 
 def _client_with_config(**overrides):
+    overrides.setdefault("http_heartbeat_interval", 0)
     config = ShimConfig(
         command="claude",
         args=["-p"],
@@ -122,6 +124,7 @@ def test_non_claude_chat_completions_keep_full_transcript_without_resume():
                 cwd="/tmp",
                 timeout=30.0,
                 models=["codex"],
+                http_heartbeat_interval=0,
             )
         )
     )

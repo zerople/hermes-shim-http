@@ -9,6 +9,8 @@ import time
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="legacy")
+    parser.add_argument("--duration", type=float, default=5.0,
+                        help="Sleep duration for idle-silent / delayed-output modes.")
     parser.add_argument("prompt", nargs="?")
     args = parser.parse_args()
     prompt = args.prompt or ""
@@ -38,7 +40,12 @@ def main() -> int:
         return 0
 
     if args.mode == "idle-silent":
-        time.sleep(5)
+        time.sleep(args.duration)
+        return 0
+
+    if args.mode == "delayed-output":
+        time.sleep(args.duration)
+        print("delayed done")
         return 0
 
     if "read_file" in prompt.lower() and "read the readme" in prompt.lower():

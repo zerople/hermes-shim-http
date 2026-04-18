@@ -2,11 +2,17 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
-## [0.1.11] - 2026-04-18
+## [0.1.12] - 2026-04-18
+
+### Added
+- **Layer 1 — Child CLI heartbeat.** New `bin/heartbeat-wrap.py` wrapper, enabled by default via `--heartbeat-wrap`, spawns the child CLI and emits a zero-width-space byte (`U+200B`) to stderr every `--heartbeat-interval` seconds (default 60s) while the child is alive. Legitimate long operations (extended reasoning, network waits, large test runs) no longer trip the shim's stdout/stderr idle timeout. The shim strips the heartbeat bytes from captured output so nothing leaks into the model reply.
+- **Layer 2 — HTTP response heartbeat.** Non-streaming `/v1/chat/completions` and `/v1/responses` endpoints now emit a whitespace byte every `--http-heartbeat-interval` seconds (default 30s, `0` disables) while the child CLI runs, then yield the final JSON body. JSON's RFC 8259 leading-whitespace allowance keeps the concatenated stream a valid parse, so Hermes→shim HTTP connections (and intermediate proxies) stay alive through minute-scale runs that used to die on idle TCP close. SSE streaming endpoints were already keepalive-covered via `: ping` comments.
 
 ### Changed
-- CI: bumped `actions/setup-node` to Node 24.
-- CI: switched npm publish to classic token auth (`NPM_TOKEN` → `NODE_AUTH_TOKEN`) and removed `--provenance` since trusted publishing is not yet linked on the npm package side.
+- Child CLI stdin is now written as UTF-8 bytes (Popen no longer uses `text=True`), and stdout/stderr pipes are decoded incrementally so partial multi-byte chars across read boundaries no longer corrupt the transcript.
+
+### Notes
+- Defaults are conservative: Layer 1 fires every 60s (well under the 300s idle budget), Layer 2 every 30s (well under typical 60s HTTP idle proxies). Either can be tuned or turned off at launch with the new flags.
 
 ## [0.1.10] - 2026-04-17
 

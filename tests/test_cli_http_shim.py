@@ -365,7 +365,7 @@ class TestRunner:
                 run_cli_prompt("hello", cfg)
 
     def test_stream_cli_prompt_uses_stdin_for_claude_profile(self):
-        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0, heartbeat_wrap=False)
 
         class _FakeStream:
             def read(self, _size: int = 1) -> str:
@@ -376,9 +376,9 @@ class TestRunner:
 
         class _FakeStdin:
             def __init__(self) -> None:
-                self.value = ""
+                self.value = b""
 
-            def write(self, text: str) -> None:
+            def write(self, text: bytes) -> None:
                 self.value += text
 
             def flush(self) -> None:
@@ -407,7 +407,7 @@ class TestRunner:
             events = list(stream_cli_prompt("hello", cfg, system_prompt="Be terse."))
 
         assert events == []
-        assert fake_process.stdin.value == "Be terse.\n\nhello"
+        assert fake_process.stdin.value == b"Be terse.\n\nhello"
         mock_popen.assert_called_once_with(
             [
                 "claude",
@@ -419,12 +419,11 @@ class TestRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE,
-            text=True,
             bufsize=0,
         )
 
     def test_stream_cli_prompt_omits_large_system_prompt_from_resumed_claude_stdin(self):
-        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0, heartbeat_wrap=False)
 
         class _FakeStream:
             def read(self, _size: int = 1) -> str:
@@ -435,9 +434,9 @@ class TestRunner:
 
         class _FakeStdin:
             def __init__(self) -> None:
-                self.value = ""
+                self.value = b""
 
-            def write(self, text: str) -> None:
+            def write(self, text: bytes) -> None:
                 self.value += text
 
             def flush(self) -> None:
@@ -475,7 +474,7 @@ class TestRunner:
             )
 
         assert events == []
-        assert fake_process.stdin.value == "<user>\ncontinue\n</user>"
+        assert fake_process.stdin.value == b"<user>\ncontinue\n</user>"
         mock_popen.assert_called_once_with(
             [
                 "claude",
@@ -492,7 +491,6 @@ class TestRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE,
-            text=True,
             bufsize=0,
         )
 
@@ -502,6 +500,7 @@ class TestRunner:
             args=[str(FAKE_CLI), "--mode", "stream-text"],
             cwd=str(REPO_ROOT),
             timeout=12.0,
+            heartbeat_wrap=False,
         )
 
         events = list(stream_cli_prompt("ignored", cfg))
@@ -516,10 +515,27 @@ class TestRunner:
             args=[str(FAKE_CLI), "--mode", "idle-silent"],
             cwd=str(REPO_ROOT),
             timeout=0.3,
+            heartbeat_wrap=False,
         )
 
         with pytest.raises(TimeoutError, match="idle for"):
             list(stream_cli_prompt("ignored", cfg))
+
+    def test_heartbeat_wrap_keeps_silent_child_alive_past_idle_timeout(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "delayed-output", "--duration", "2.0"],
+            cwd=str(REPO_ROOT),
+            timeout=1.2,
+            heartbeat_wrap=True,
+            heartbeat_interval=0.3,
+        )
+
+        events = list(stream_cli_prompt("ignored", cfg))
+
+        text_payload = "".join(event.text or "" for event in events if event.kind == "text")
+        assert "delayed done" in text_payload
+        assert "\u200b" not in text_payload
 
     def test_stream_cli_prompt_translates_argument_list_too_long_error(self):
         cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)
@@ -537,6 +553,7 @@ class TestRunner:
             args=[str(FAKE_CLI), "--mode", "stream-tool"],
             cwd=str(REPO_ROOT),
             timeout=12.0,
+            heartbeat_wrap=False,
         )
 
         events = list(stream_cli_prompt("ignored", cfg))

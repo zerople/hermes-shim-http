@@ -67,3 +67,6 @@ class ShimConfig(BaseModel):
     compaction_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
     log_level: Literal["info", "debug"] = "info"
     log_format: Literal["text", "json"] = "text"
+    heartbeat_wrap: bool = True
+    heartbeat_interval: float = Field(default=60.0, gt=0.0)
+    http_heartbeat_interval: float = Field(default=30.0, ge=0.0)
