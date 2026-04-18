@@ -56,6 +56,24 @@ def main() -> int:
         print("delayed done")
         return 0
 
+    if args.mode == "chatty-long":
+        deadline = time.time() + args.duration
+        i = 0
+        while time.time() < deadline:
+            print(f"tick {i}", flush=True)
+            time.sleep(0.1)
+            i += 1
+        return 0
+
+    if args.mode == "flood":
+        # Emit args.duration megabytes as fast as possible.
+        megs = int(args.duration)
+        payload = ("x" * 1024 + "\n") * 1024  # ~1 MB
+        for _ in range(megs):
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+        return 0
+
     if "read_file" in prompt.lower() and "read the readme" in prompt.lower():
         print('<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>')
     elif "say hello" in prompt.lower():

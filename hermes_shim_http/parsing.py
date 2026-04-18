@@ -101,7 +101,9 @@ class IncrementalToolCallParser:
         if candidate_indexes:
             return min(candidate_indexes)
 
-        for start in range(len(buffer)):
+        tail_window = max(len(_TOOL_CALL_OPEN), len(_TOOL_CALL_CLOSE)) - 1
+        tail_start = max(0, len(buffer) - tail_window)
+        for start in range(tail_start, len(buffer)):
             suffix = buffer[start:]
             if _TOOL_CALL_OPEN.startswith(suffix) or _TOOL_CALL_CLOSE.startswith(suffix):
                 return start

@@ -63,6 +63,31 @@ def test_incremental_parser_streams_plain_text_chunks():
     assert "".join(event.text for event in first + second + final if event.text) == "Hello world"
 
 
+def test_incremental_parser_flushes_long_plain_text_without_tag_hint():
+    parser = IncrementalToolCallParser()
+
+    big_chunk = "a" * 100_000
+    events = parser.feed(big_chunk)
+    text = "".join(event.text for event in events if event.text)
+
+    # With tail-window cap, almost the whole buffer should flush immediately;
+    # only a short residual (< len("</tool_call>")) may remain buffered.
+    assert len(text) >= len(big_chunk) - len("</tool_call>")
+
+
+def test_incremental_parser_preserves_partial_open_tag_prefix():
+    parser = IncrementalToolCallParser()
+
+    events = parser.feed("some output ending with <tool_cal")
+    events_final = parser.finalize()
+
+    streamed = "".join(event.text for event in events if event.text)
+    # The "<tool_cal" prefix must NOT be flushed prematurely.
+    assert "<tool_cal" not in streamed
+    final_text = "".join(event.text for event in events_final if event.text)
+    assert "<tool_cal" in (streamed + final_text)
+
+
 def test_incremental_parser_hides_tool_call_wrapper_until_complete_block():
     parser = IncrementalToolCallParser()
 

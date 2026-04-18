@@ -5,6 +5,50 @@ import time
 from hermes_shim_http.session_cache import SessionCache
 
 
+def test_session_cache_blocks_concurrent_resume_of_same_parent(tmp_path):
+    cache_path = tmp_path / "sessions.sqlite"
+    cache = SessionCache(path=str(cache_path), ttl_seconds=60.0, max_entries=10)
+    first = cache.plan_request(
+        messages=[{"role": "user", "content": "hello"}],
+        model="claude-cli",
+        tools=None,
+        tool_choice=None,
+    )
+    cache.record_success(first, assistant_messages=[{"role": "assistant", "content": "hi"}])
+
+    resume_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "continue"},
+    ]
+    plan_a = cache.plan_request(
+        messages=resume_messages,
+        model="claude-cli",
+        tools=None,
+        tool_choice=None,
+    )
+    plan_b = cache.plan_request(
+        messages=resume_messages,
+        model="claude-cli",
+        tools=None,
+        tool_choice=None,
+    )
+
+    assert plan_a.resume_session_id == first.session_id
+    # Second concurrent planner must NOT resume the same parent while first is in flight.
+    assert plan_b.resume_session_id is None
+
+    # Once released, subsequent plans are free to resume again.
+    cache.release_plan(plan_a)
+    plan_c = cache.plan_request(
+        messages=resume_messages,
+        model="claude-cli",
+        tools=None,
+        tool_choice=None,
+    )
+    assert plan_c.resume_session_id == first.session_id
+
+
 def test_session_cache_persists_across_instances(tmp_path):
     cache_path = tmp_path / "sessions.sqlite"
     cache_a = SessionCache(path=str(cache_path), ttl_seconds=60.0, max_entries=10)

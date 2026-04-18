@@ -70,3 +70,5 @@ class ShimConfig(BaseModel):
     heartbeat_wrap: bool = True
     heartbeat_interval: float = Field(default=60.0, gt=0.0)
     http_heartbeat_interval: float = Field(default=30.0, ge=0.0)
+    hard_deadline_seconds: float = Field(default=1800.0, ge=0.0)
+    max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=0)

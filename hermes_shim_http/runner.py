@@ -203,6 +203,19 @@ def run_cli_prompt(
     return result
 
 
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
 def _drain_cli_process(
     command: List[str],
     *,
@@ -230,7 +243,7 @@ def _drain_cli_process(
         finally:
             process.stdin.close()
     if process.stdout is None or process.stderr is None:
-        process.kill()
+        _terminate_process(process)
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
     stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -244,7 +257,11 @@ def _drain_cli_process(
     stderr_chunks: list[str] = []
     stdout_done = False
     stderr_done = False
-    last_activity = time.time()
+    started_at = time.time()
+    last_activity = started_at
+    total_bytes = 0
+    max_bytes = config.max_output_bytes
+    hard_deadline = config.hard_deadline_seconds
 
     try:
         while not stdout_done or not stderr_done:
@@ -261,7 +278,17 @@ def _drain_cli_process(
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
                         last_activity = time.time()
-                        stdout_chunks.append(cleaned)
+                        if max_bytes and total_bytes < max_bytes:
+                            remaining = max_bytes - total_bytes
+                            chunk_bytes = len(cleaned.encode("utf-8"))
+                            if chunk_bytes > remaining:
+                                stdout_chunks.append(cleaned.encode("utf-8")[:remaining].decode("utf-8", errors="ignore"))
+                                total_bytes = max_bytes
+                            else:
+                                stdout_chunks.append(cleaned)
+                                total_bytes += chunk_bytes
+                        elif not max_bytes:
+                            stdout_chunks.append(cleaned)
 
             while True:
                 try:
@@ -283,19 +310,31 @@ def _drain_cli_process(
             if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
                 stdout_done = True
 
-            if time.time() - last_activity > config.timeout:
-                process.kill()
+            now = time.time()
+            if now - last_activity > config.timeout:
                 raise TimeoutError(
                     f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
                 )
+            if hard_deadline and (now - started_at) > hard_deadline:
+                raise TimeoutError(
+                    f"CLI process exceeded hard deadline of {hard_deadline:.1f}s"
+                )
+            if max_bytes and total_bytes >= max_bytes:
+                raise RuntimeError(
+                    f"CLI process exceeded max output cap of {max_bytes} bytes"
+                )
 
-        stdout_thread.join(timeout=0.2)
-        stderr_thread.join(timeout=0.2)
-        exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
-    except Exception:
-        if process.poll() is None:
-            process.kill()
-        raise
+        stdout_thread.join(timeout=0.5)
+        stderr_thread.join(timeout=0.5)
+        try:
+            exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
+        except subprocess.TimeoutExpired:
+            _terminate_process(process)
+            raise RuntimeError("CLI process did not exit after pipes closed")
+    finally:
+        _terminate_process(process)
+        stdout_thread.join(timeout=0.5)
+        stderr_thread.join(timeout=0.5)
 
     return "".join(stdout_chunks), "".join(stderr_chunks), int(exit_code)
 
@@ -381,7 +420,7 @@ def stream_cli_prompt(
         process.stdin.flush()
         process.stdin.close()
     if process.stdout is None or process.stderr is None:
-        process.kill()
+        _terminate_process(process)
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
     stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -390,6 +429,9 @@ def stream_cli_prompt(
     stderr_done = False
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
+    total_bytes = 0
+    max_bytes = config.max_output_bytes
+    hard_deadline = config.hard_deadline_seconds
     parser = IncrementalToolCallParser()
 
     stdout_thread = threading.Thread(
@@ -420,6 +462,9 @@ def stream_cli_prompt(
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
                         last_activity = time.time()
+                        if max_bytes:
+                            chunk_bytes = len(cleaned.encode("utf-8"))
+                            total_bytes += chunk_bytes
                         stdout_chunks.append(cleaned)
                         for event in parser.feed(cleaned):
                             yield event
@@ -445,22 +490,33 @@ def stream_cli_prompt(
             if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
                 stdout_done = True
 
-            if time.time() - last_activity > config.timeout:
-                process.kill()
+            now = time.time()
+            if now - last_activity > config.timeout:
                 raise TimeoutError(
                     f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
                 )
+            if hard_deadline and (now - started) > hard_deadline:
+                raise TimeoutError(
+                    f"CLI process exceeded hard deadline of {hard_deadline:.1f}s"
+                )
+            if max_bytes and total_bytes >= max_bytes:
+                raise RuntimeError(
+                    f"CLI process exceeded max output cap of {max_bytes} bytes"
+                )
 
-        stdout_thread.join(timeout=0.2)
-        stderr_thread.join(timeout=0.2)
+        stdout_thread.join(timeout=0.5)
+        stderr_thread.join(timeout=0.5)
         for event in parser.finalize():
             yield event
 
-        exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
+        try:
+            exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("CLI process did not exit after pipes closed")
         if exit_code != 0:
             detail = "".join(stderr_chunks).strip() or "".join(stdout_chunks).strip() or f"exit code {exit_code}"
             raise RuntimeError(f"CLI process failed: {detail}")
-    except Exception:
-        if process.poll() is None:
-            process.kill()
-        raise
+    finally:
+        _terminate_process(process)
+        stdout_thread.join(timeout=0.5)
+        stderr_thread.join(timeout=0.5)

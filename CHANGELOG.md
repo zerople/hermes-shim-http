@@ -2,6 +2,22 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.14] - 2026-04-18
+
+### Fixed
+- **Orphaned child CLI on client disconnect (P0).** When an HTTP client closed a streaming connection mid-stream, Starlette fed `GeneratorExit` into the SSE generator, which the previous `except Exception:` block could not catch — the inner `stream_cli_prompt` generator was abandoned, leaving the child Claude/Codex/OpenCode process and its `heartbeat-wrap` wrapper running until their own idle timers fired. Under unattended autonomous operation (LCK fleet, 24/7 multi-pilot runs) this silently leaked process-table slots, pipe FDs, and memory. Both `run_cli_prompt` and `stream_cli_prompt` now clean up via `finally: _terminate_process(process)`, `_iter_events_with_keepalive` closes the source generator on early exit, and `_stream_live_chat_chunks` / `_stream_live_responses_events` close their `stream_cli_prompt` iterator in `finally`. Covered by a new `test_stream_cli_prompt_finally_kills_child_on_generator_close` test that spawns a long-lived child, calls `gen.close()`, and asserts the PID is gone within 5s.
+- **Session-cache fork race (P1).** Two concurrent requests with the same message prefix could both observe the same `best_match` parent session and plan to `--resume --fork-session` against it simultaneously, corrupting stored history. `SessionCache` now tracks `_in_flight_parents` under the existing lock; a second request hitting a parent that is already being forked falls through to a fresh session (and emits a `session_plan_in_flight_skip` event). `record_success` and the new `release_plan` helper clear the in-flight marker on completion or abort.
+- **`IncrementalToolCallParser` quadratic buffer scan (P1).** The parser's `_safe_prefix_length` previously scanned the entire accumulated buffer from the start for a potential `<tool_call>` / `</tool_call>` prefix on every feed. A long plain-text chunk without any tool tags (extended reasoning output, cargo test dumps) made this O(n²) and held the whole chunk buffered. The lookahead is now capped to the max tag length, so long plain-text chunks flush immediately.
+- **Implicit `subprocess.TimeoutExpired` on final wait (P1).** `process.wait(timeout=...)` after the pipes drained used to propagate `TimeoutExpired` unchanged. It is now explicitly caught, the process force-killed, and a `RuntimeError("CLI process did not exit after pipes closed")` surfaced.
+
+### Added
+- **`ShimConfig.hard_deadline_seconds` (default 1800s, `0` disables).** Absolute wall-clock deadline for a single child CLI invocation, enforced by both `run_cli_prompt` and `stream_cli_prompt`. Complements the existing idle `--timeout`: heartbeat activity keeps the idle timer alive indefinitely, but the hard deadline still kicks in and returns a `TimeoutError("CLI process exceeded hard deadline of Xs")` so runaway work cannot pin a worker forever. Intended for autonomous operation where a stuck worker must eventually be reclaimed even when the child keeps streaming output.
+- **`ShimConfig.max_output_bytes` (default 32 MiB, `0` disables).** Caps total stdout bytes captured per invocation. `run_cli_prompt` truncates cleanly at the cap; `stream_cli_prompt` raises `RuntimeError("CLI process exceeded max output cap of N bytes")` to guard against runaway `cargo test`-style dumps accidentally ballooning shim memory.
+
+### Changed
+- `_terminate_process` helper always waits up to 2s for the child to exit after `kill()`, and pipe-drainer thread joins extended from 0.2s → 0.5s so heartbeat-wrap's daemon pump threads release FDs before the generator returns.
+- `session_cache.record_success` now also clears the in-flight parent marker it acquired in `plan_request`.
+
 ## [0.1.13] - 2026-04-18
 
 ### Fixed

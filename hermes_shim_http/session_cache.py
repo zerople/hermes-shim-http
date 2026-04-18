@@ -50,6 +50,7 @@ class SessionCache:
         self.max_entries = max_entries
         self.ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
+        self._in_flight_parents: set[str] = set()
         self._memory_dsn: str | None = None
         self._keeper: sqlite3.Connection | None = None
         if self.path:
@@ -132,12 +133,13 @@ class SessionCache:
                         best_prefix_len = prefix_len
                         best_match = entry
 
-                if best_match is not None and best_prefix_len > 0:
+                if best_match is not None and best_prefix_len > 0 and best_match.session_id not in self._in_flight_parents:
                     conn.execute(
                         "UPDATE sessions SET last_used = ?, hit_count = hit_count + 1 WHERE cache_key = ?",
                         (now, best_match.cache_key),
                     )
                     conn.commit()
+                    self._in_flight_parents.add(best_match.session_id)
                     delta_messages = normalized_messages[best_prefix_len:]
                     prompt_text = build_cli_resume_delta_prompt(messages=delta_messages)
                     emit_event(
@@ -160,6 +162,13 @@ class SessionCache:
                         model=model,
                         tools=tools,
                         tool_choice=tool_choice,
+                    )
+                if best_match is not None and best_match.session_id in self._in_flight_parents:
+                    emit_event(
+                        "session_plan_in_flight_skip",
+                        model=model,
+                        parent_session_id=best_match.session_id,
+                        new_session_id=session_id,
                     )
 
         emit_event(
@@ -184,6 +193,12 @@ class SessionCache:
             tool_choice=tool_choice,
         )
 
+    def release_plan(self, plan: SessionPlan) -> None:
+        if not plan.resume_session_id:
+            return
+        with self._lock:
+            self._in_flight_parents.discard(plan.resume_session_id)
+
     def record_success(self, plan: SessionPlan, *, assistant_messages: list[dict[str, Any]] | None = None) -> None:
         now = time.time()
         conversation_messages = [*plan.messages]
@@ -196,6 +211,8 @@ class SessionCache:
             messages=conversation_messages,
         )
         with self._lock:
+            if plan.resume_session_id:
+                self._in_flight_parents.discard(plan.resume_session_id)
             with self._connect() as conn:
                 conn.execute(
                     """

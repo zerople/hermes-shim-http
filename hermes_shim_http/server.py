@@ -361,18 +361,27 @@ def _iter_events_with_keepalive(source: Iterator[CliStreamEvent], *, keepalive_i
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
     done = False
-    while not done:
-        try:
-            item = sink.get(timeout=keepalive_interval)
-        except queue.Empty:
-            yield None
-            continue
-        if item is sentinel:
-            done = True
-            continue
-        if isinstance(item, BaseException):
-            raise item
-        yield item
+    try:
+        while not done:
+            try:
+                item = sink.get(timeout=keepalive_interval)
+            except queue.Empty:
+                yield None
+                continue
+            if item is sentinel:
+                done = True
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        if not done:
+            try:
+                if hasattr(source, "close"):
+                    source.close()
+            except Exception:
+                pass
+            thread.join(timeout=5.0)
 
 
 def _record_metrics(app: FastAPI, *, latency_ms: int, cache_hit: bool, usage: TokenUsageEstimate, compacted: bool) -> None:
@@ -639,15 +648,16 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
     emit_log(logger, event="stream_start", request_id=request_id, model=model)
     yield _sse_line({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
 
+    source = stream_cli_prompt(
+        prompt,
+        config,
+        session_id=session_plan.session_id,
+        resume_session_id=session_plan.resume_session_id,
+        system_prompt=session_plan.system_prompt_text,
+        model=model,
+    )
+    recorded = False
     try:
-        source = stream_cli_prompt(
-            prompt,
-            config,
-            session_id=session_plan.session_id,
-            resume_session_id=session_plan.resume_session_id,
-            system_prompt=session_plan.system_prompt_text,
-            model=model,
-        )
         for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
                 yield b": ping\n\n"
@@ -685,6 +695,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
         pending_text = ""
         parsed = ParsedShimOutput(content="" if silent else cleaned_text, tool_calls=completed_tool_calls, silent=silent)
         session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
+        recorded = True
         usage = estimate_token_usage(messages=request_messages, response_text=parsed.content)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
         final_choice: dict[str, Any] = {"index": 0, "delta": {}, "finish_reason": "tool_calls" if saw_tool_calls else "stop"}
@@ -697,6 +708,17 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
     except Exception as exc:
         emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
         raise
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass
+        if not recorded:
+            try:
+                session_cache.release_plan(session_plan)
+            except Exception:
+                pass
+            emit_log(logger, event="stream_aborted", request_id=request_id, model=model)
 
 
 def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, compacted: bool) -> Iterator[bytes]:
@@ -738,8 +760,9 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         pending_text_output_index = output_index
         yield _sse_line({"type": "response.output_item.added", "output_index": pending_text_output_index, "item": {"type": "message", "id": pending_text_item_id, "role": "assistant", "status": "in_progress", "content": []}})
 
+    source = stream_cli_prompt(prompt, config, model=model)
     try:
-        for event in _iter_events_with_keepalive(stream_cli_prompt(prompt, config, model=model), keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
+        for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
                 yield b": ping\n\n"
                 continue
@@ -816,6 +839,11 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
     except Exception as exc:
         emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
         raise
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass
 
 
 def _infer_cli_profile(command: str) -> str:

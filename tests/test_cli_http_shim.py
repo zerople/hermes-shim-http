@@ -15,6 +15,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FAKE_CLI = REPO_ROOT / "tests" / "fake_cli.py"
 
 
+def _is_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/status", "r") as fp:
+            for line in fp:
+                if line.startswith("State:"):
+                    return "Z" in line
+    except OSError:
+        return True
+    return False
+
+
 class TestPrompting:
     def test_build_cli_system_prompt_has_no_roleplay_triggers(self):
         system_prompt = build_cli_system_prompt(
@@ -583,6 +594,87 @@ class TestRunner:
         ):
             with pytest.raises(RuntimeError, match="Prompt too large to pass on the command line"):
                 list(stream_cli_prompt("hello", cfg))
+
+    def test_stream_cli_prompt_enforces_hard_deadline_even_with_active_output(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "chatty-long", "--duration", "10.0"],
+            cwd=str(REPO_ROOT),
+            timeout=30.0,
+            hard_deadline_seconds=0.6,
+            heartbeat_wrap=False,
+        )
+
+        with pytest.raises(TimeoutError, match="hard deadline"):
+            list(stream_cli_prompt("ignored", cfg))
+
+    def test_stream_cli_prompt_caps_output_bytes(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "flood", "--duration", "4"],
+            cwd=str(REPO_ROOT),
+            timeout=30.0,
+            max_output_bytes=64 * 1024,
+            heartbeat_wrap=False,
+        )
+
+        with pytest.raises(RuntimeError, match="max output cap"):
+            list(stream_cli_prompt("ignored", cfg))
+
+    def test_stream_cli_prompt_finally_kills_child_on_generator_close(self):
+        import os
+        import time as _time
+
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "chatty-long", "--duration", "30.0"],
+            cwd=str(REPO_ROOT),
+            timeout=60.0,
+            heartbeat_wrap=False,
+        )
+
+        def _read_children_pids() -> set[int]:
+            my_pid = os.getpid()
+            try:
+                out = subprocess.check_output(["pgrep", "-P", str(my_pid)], text=True)
+            except subprocess.CalledProcessError:
+                return set()
+            return {int(x) for x in out.split() if x.strip().isdigit()}
+
+        gen = stream_cli_prompt("ignored", cfg)
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+        pids_before = _read_children_pids()
+        assert pids_before, "expected at least one direct child after first yield"
+
+        gen.close()
+
+        deadline = _time.time() + 5.0
+        while _time.time() < deadline:
+            still_alive = {
+                pid for pid in pids_before
+                if os.path.exists(f"/proc/{pid}") and not _is_zombie(pid)
+            }
+            if not still_alive:
+                break
+            _time.sleep(0.1)
+        else:
+            raise AssertionError(f"child processes leaked after generator close: {pids_before}")
+
+    def test_run_cli_prompt_enforces_hard_deadline(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "chatty-long", "--duration", "10.0"],
+            cwd=str(REPO_ROOT),
+            timeout=30.0,
+            hard_deadline_seconds=0.6,
+            heartbeat_wrap=False,
+        )
+
+        with pytest.raises(TimeoutError, match="hard deadline"):
+            run_cli_prompt("ignored", cfg)
 
     def test_stream_cli_prompt_yields_tool_call_event_without_wrapper_text(self):
         cfg = ShimConfig(
