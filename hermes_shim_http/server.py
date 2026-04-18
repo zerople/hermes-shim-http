@@ -21,7 +21,7 @@ from .parsing import IncrementalToolCallParser, parse_cli_output
 from .prompting import build_cli_prompt, compact_messages
 from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
-from .silence import detect_and_strip as _detect_silent
+from .silence import detect_and_strip as _detect_silent, silent_sentinel
 from .slash_commands import dispatch_slash_command
 from .telemetry import emit_event
 from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_token_usage
@@ -29,6 +29,23 @@ from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_tok
 SILENT_HEADER = "X-Shim-Silent"
 
 KEEPALIVE_INTERVAL_SECONDS = 10.0
+
+
+def _is_silent_candidate(accumulated: str, sentinel: str) -> bool:
+    """True while the streamed-so-far text could still collapse to a silent ACK.
+
+    Streaming paths must not flush the literal sentinel as a content delta —
+    once the client sees it, the turn can't be collapsed to an empty ACK.
+    Buffer while the output is either (a) an incomplete prefix of the
+    sentinel, or (b) the sentinel itself possibly padded with whitespace.
+    """
+    stripped = accumulated.strip()
+    if not stripped:
+        return True
+    if sentinel.startswith(stripped):
+        return True
+    _, is_silent = _detect_silent(stripped, has_tool_calls=False)
+    return is_silent
 
 
 def _usage_dict(estimate: TokenUsageEstimate) -> dict[str, int]:
@@ -574,6 +591,8 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
     pending_text = ""
     completed_tool_calls: list[dict[str, Any]] = []
     assistant_text_chunks: list[str] = []
+    sentinel = silent_sentinel()
+    silent_window_closed = False
     started = time.time()
 
     emit_log(logger, event="stream_start", request_id=request_id, model=model)
@@ -608,13 +627,21 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
             elif event.kind == "text" and event.text:
                 pending_text += event.text
                 assistant_text_chunks.append(event.text)
-                if "\n" in pending_text or len(pending_text) >= 24 or (event.text[-1:].isspace() and len(pending_text) >= 8):
+                if not silent_window_closed and not _is_silent_candidate("".join(assistant_text_chunks), sentinel):
+                    silent_window_closed = True
+                if silent_window_closed and (
+                    "\n" in pending_text
+                    or len(pending_text) >= 24
+                    or (event.text[-1:].isspace() and len(pending_text) >= 8)
+                ):
                     yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
                     pending_text = ""
 
-        yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
         accumulated_text = "".join(assistant_text_chunks)
         cleaned_text, silent = _detect_silent(accumulated_text.strip(), has_tool_calls=bool(completed_tool_calls))
+        if not silent:
+            yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
+        pending_text = ""
         parsed = ParsedShimOutput(content="" if silent else cleaned_text, tool_calls=completed_tool_calls, silent=silent)
         session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
         usage = estimate_token_usage(messages=request_messages, response_text=parsed.content)
@@ -639,6 +666,10 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
     pending_text_output_index: int | None = None
     output_index = 0
     output_items: list[dict[str, Any]] = []
+    sentinel = silent_sentinel()
+    silent_window_closed = False
+    buffered_text = ""
+    accumulated_text_for_silence = ""
     started = time.time()
 
     response_stub = {"id": response_id, "object": "response", "created_at": created_at, "status": "in_progress", "model": model, "output": []}
@@ -672,10 +703,19 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
                 yield b": ping\n\n"
                 continue
             if event.kind == "tool_call" and event.tool_call:
+                # Tool call definitively rules out silent ACK; drain any buffered text.
+                if not silent_window_closed:
+                    silent_window_closed = True
+                    if buffered_text:
+                        pending_text += buffered_text
+                        yield from ensure_text_item_started()
+                        yield _sse_line({"type": "response.output_text.delta", "delta": buffered_text, "output_index": pending_text_output_index, "content_index": 0})
+                        buffered_text = ""
                 name = str(event.tool_call.get("function", {}).get("name") or "").strip()
                 if allowed_tool_names is not None and name not in allowed_tool_names:
                     fallback_text = _unsupported_tool_message([name])
                     pending_text += fallback_text
+                    accumulated_text_for_silence += fallback_text
                     yield from ensure_text_item_started()
                     yield _sse_line({"type": "response.output_text.delta", "delta": fallback_text, "output_index": pending_text_output_index, "content_index": 0})
                     continue
@@ -686,11 +726,33 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
                 yield _sse_line({"type": "response.output_item.done", "output_index": output_index, "item": item})
                 output_index += 1
             elif event.kind == "text" and event.text:
+                accumulated_text_for_silence += event.text
+                if not silent_window_closed:
+                    if _is_silent_candidate(accumulated_text_for_silence, sentinel):
+                        buffered_text += event.text
+                        continue
+                    silent_window_closed = True
+                    if buffered_text:
+                        pending_text += buffered_text
+                        yield from ensure_text_item_started()
+                        yield _sse_line({"type": "response.output_text.delta", "delta": buffered_text, "output_index": pending_text_output_index, "content_index": 0})
+                        buffered_text = ""
                 pending_text += event.text
                 yield from ensure_text_item_started()
                 yield _sse_line({"type": "response.output_text.delta", "delta": event.text, "output_index": pending_text_output_index, "content_index": 0})
 
-        yield from flush_text()
+        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
+        cleaned_text, silent = _detect_silent(accumulated_text_for_silence.strip(), has_tool_calls=has_tool_calls)
+        if silent:
+            # Silent ACK — never emit the buffered sentinel as a message item.
+            buffered_text = ""
+        else:
+            if buffered_text:
+                pending_text += buffered_text
+                yield from ensure_text_item_started()
+                yield _sse_line({"type": "response.output_text.delta", "delta": buffered_text, "output_index": pending_text_output_index, "content_index": 0})
+                buffered_text = ""
+            yield from flush_text()
         response_text = "".join(
             content["text"]
             for item in output_items
@@ -698,8 +760,8 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
             for content in item.get("content", [])
             if isinstance(content, dict) and isinstance(content.get("text"), str)
         )
-        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
-        cleaned_text, silent = _detect_silent(response_text.strip(), has_tool_calls=has_tool_calls)
+        # Re-derive silent after possibly flushing — response_text is the canonical source.
+        _, silent = _detect_silent(response_text.strip() or accumulated_text_for_silence.strip(), has_tool_calls=has_tool_calls)
         usage = estimate_token_usage(messages=request_messages, response_text="" if silent else cleaned_text)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=False, usage=usage, compacted=compacted)
         completed_output_items = [item for item in output_items if item.get("type") != "message"] if silent else output_items

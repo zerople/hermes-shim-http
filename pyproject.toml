@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-shim-http"
-version = "0.1.9"
+version = "0.1.10"
 description = "OpenAI-compatible HTTP shim for local coding CLIs"
 readme = "README.md"
 requires-python = ">=3.10"
