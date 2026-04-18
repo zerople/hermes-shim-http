@@ -258,9 +258,9 @@ def _drain_cli_process(
                         stdout_done = True
                 else:
                     _, chunk = item
-                    last_activity = time.time()
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
+                        last_activity = time.time()
                         stdout_chunks.append(cleaned)
 
             while True:
@@ -273,9 +273,9 @@ def _drain_cli_process(
                         stderr_done = True
                     continue
                 _, chunk = item
-                last_activity = time.time()
                 cleaned = _strip_heartbeat(chunk)
                 if cleaned:
+                    last_activity = time.time()
                     stderr_chunks.append(cleaned)
 
             if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
@@ -286,7 +286,7 @@ def _drain_cli_process(
             if time.time() - last_activity > config.timeout:
                 process.kill()
                 raise TimeoutError(
-                    f"CLI process idle for {config.timeout:.1f}s with no stdout/stderr output"
+                    f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
                 )
 
         stdout_thread.join(timeout=0.2)
@@ -417,9 +417,9 @@ def stream_cli_prompt(
                         stdout_done = True
                 else:
                     _, chunk = item
-                    last_activity = time.time()
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
+                        last_activity = time.time()
                         stdout_chunks.append(cleaned)
                         for event in parser.feed(cleaned):
                             yield event
@@ -434,9 +434,9 @@ def stream_cli_prompt(
                         stderr_done = True
                     continue
                 _, chunk = item
-                last_activity = time.time()
                 cleaned = _strip_heartbeat(chunk)
                 if cleaned:
+                    last_activity = time.time()
                     stderr_chunks.append(cleaned)
 
             if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
@@ -448,7 +448,7 @@ def stream_cli_prompt(
             if time.time() - last_activity > config.timeout:
                 process.kill()
                 raise TimeoutError(
-                    f"CLI process idle for {config.timeout:.1f}s with no stdout/stderr output"
+                    f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
                 )
 
         stdout_thread.join(timeout=0.2)

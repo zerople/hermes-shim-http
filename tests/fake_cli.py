@@ -43,6 +43,14 @@ def main() -> int:
         time.sleep(args.duration)
         return 0
 
+    if args.mode == "heartbeat-only":
+        deadline = time.time() + args.duration
+        while time.time() < deadline:
+            sys.stderr.buffer.write("\u200b".encode("utf-8"))
+            sys.stderr.buffer.flush()
+            time.sleep(0.1)
+        return 0
+
     if args.mode == "delayed-output":
         time.sleep(args.duration)
         print("delayed done")

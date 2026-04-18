@@ -818,6 +818,12 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         raise
 
 
+def _infer_cli_profile(command: str) -> str:
+    import os as _os
+    base = _os.path.basename((command or "").strip()).lower()
+    return {"claude": "claude", "codex": "codex", "opencode": "opencode"}.get(base, "generic")
+
+
 def create_app(config: ShimConfig | None = None) -> FastAPI:
     cfg = config or ShimConfig(command="claude")
     app = FastAPI(title="Hermes CLI HTTP Shim", version=__version__)
@@ -828,14 +834,80 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     app.state.pending_compactions = {}
     logger = configure_logger(log_level=cfg.log_level, log_format=cfg.log_format, logger_name=f"hermes_shim_http.{id(app)}")
 
+    def _context_window_for(model: str) -> int:
+        profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
+        name = (model or "").lower()
+        if profile == "claude" or "claude" in name or name in {"opus", "sonnet", "haiku"}:
+            return 200_000
+        if profile == "codex" or "gpt-" in name or "codex" in name:
+            return 400_000
+        if profile == "opencode":
+            return 200_000
+        return 128_000
+
+    def _max_output_tokens_for(model: str) -> int:
+        profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
+        if profile == "claude":
+            return 64_000
+        if profile == "codex":
+            return 32_000
+        return 16_000
+
     def _model_payload(model: str) -> dict[str, Any]:
-        return {"id": model, "object": "model", "created": 0, "owned_by": cfg.provider_label}
+        ctx = _context_window_for(model)
+        return {
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": cfg.provider_label,
+            "context_length": ctx,
+            "max_model_len": ctx,
+            "max_completion_tokens": _max_output_tokens_for(model),
+        }
 
     def _models_payload() -> dict[str, Any]:
         return {"object": "list", "data": [_model_payload(model) for model in cfg.models]}
 
     def _props_payload() -> dict[str, Any]:
         return {"provider_label": cfg.provider_label, "api_mode": "chat_completions", "models": list(cfg.models)}
+
+    def _info_payload() -> dict[str, Any]:
+        default_model = cfg.models[0] if cfg.models else ""
+        profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
+        ctx = _context_window_for(default_model) if default_model else 128_000
+        max_out = _max_output_tokens_for(default_model) if default_model else 16_000
+        return {
+            "server": "hermes-shim-http",
+            "version": __version__,
+            "backend": "cli-http-shim",
+            "cli_profile": profile,
+            "cli_command": cfg.command,
+            "provider_label": cfg.provider_label,
+            "model_id": default_model,
+            "model_dtype": "external-cli",
+            "models": [_model_payload(m) for m in cfg.models],
+            "max_input_length": ctx,
+            "max_total_tokens": ctx,
+            "max_concurrent_requests": 1,
+            "capabilities": {
+                "streaming": True,
+                "tools": True,
+                "tool_choice": True,
+                "vision": profile == "claude",
+                "prompt_caching": profile == "claude",
+                "session_resume": profile in {"claude", "codex", "opencode"},
+                "reasoning": profile == "claude",
+                "chat_completions": True,
+                "responses_api": True,
+            },
+            "api_modes": ["chat_completions", "responses"],
+            "compaction": cfg.compaction,
+            "heartbeat": {
+                "child_wrap": cfg.heartbeat_wrap,
+                "child_interval_seconds": cfg.heartbeat_interval,
+                "http_interval_seconds": cfg.http_heartbeat_interval,
+            },
+        }
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -866,6 +938,14 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     @app.get("/props")
     def props_root() -> dict[str, Any]:
         return _props_payload()
+
+    @app.get("/v1/info")
+    def info_v1() -> dict[str, Any]:
+        return _info_payload()
+
+    @app.get("/info")
+    def info_root() -> dict[str, Any]:
+        return _info_payload()
 
     @app.get("/version")
     def version() -> dict[str, str]:

@@ -84,12 +84,44 @@ def test_probe_endpoints_return_benign_compatibility_responses():
     assert client.get("/v1/props").status_code == 200
     assert client.get("/props").status_code == 200
     assert client.get("/version").status_code == 200
+    assert client.get("/v1/info").status_code == 200
+    assert client.get("/info").status_code == 200
 
     assert client.get("/api/v1/models").json()["object"] == "list"
     assert client.get("/api/tags").json()["models"][0]["name"] == "sonnet"
     assert client.get("/v1/props").json()["api_mode"] == "chat_completions"
     assert client.get("/props").json()["provider_label"] == "cli-http-shim"
     assert client.get("/version").json()["version"] == __version__
+
+
+def test_info_endpoint_reports_capabilities_and_context_window_for_claude():
+    client = _client()
+
+    payload = client.get("/v1/info").json()
+
+    assert payload["server"] == "hermes-shim-http"
+    assert payload["version"] == __version__
+    assert payload["cli_profile"] == "claude"
+    assert payload["model_id"] == "sonnet"
+    assert payload["max_input_length"] == 200_000
+    assert payload["max_total_tokens"] == 200_000
+    assert payload["capabilities"]["streaming"] is True
+    assert payload["capabilities"]["tools"] is True
+    assert payload["capabilities"]["prompt_caching"] is True
+    assert payload["capabilities"]["session_resume"] is True
+    assert payload["api_modes"] == ["chat_completions", "responses"]
+    assert payload["models"][0]["context_length"] == 200_000
+
+
+def test_models_endpoint_includes_context_length_metadata():
+    client = _client()
+
+    data = client.get("/v1/models").json()["data"]
+
+    for entry in data:
+        assert entry["context_length"] == 200_000
+        assert entry["max_model_len"] == 200_000
+        assert entry["max_completion_tokens"] == 64_000
 
 
 def test_chat_completions_returns_plain_text():

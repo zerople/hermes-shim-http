@@ -354,6 +354,18 @@ class TestRunner:
             with pytest.raises(TimeoutError, match="idle for"):
                 run_cli_prompt("hello", cfg)
 
+    def test_run_cli_prompt_raises_idle_timeout_when_child_emits_heartbeat_only(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "heartbeat-only", "--duration", "5.0"],
+            cwd=str(REPO_ROOT),
+            timeout=0.6,
+            heartbeat_wrap=False,
+        )
+
+        with pytest.raises(TimeoutError, match="idle for"):
+            run_cli_prompt("ignored", cfg)
+
     def test_run_cli_prompt_translates_argument_list_too_long_error(self):
         cfg = ShimConfig(command="codex", args=["exec"], cwd="/tmp/work", timeout=12.0)
 
@@ -521,12 +533,37 @@ class TestRunner:
         with pytest.raises(TimeoutError, match="idle for"):
             list(stream_cli_prompt("ignored", cfg))
 
-    def test_heartbeat_wrap_keeps_silent_child_alive_past_idle_timeout(self):
+    def test_stream_cli_prompt_raises_idle_timeout_when_child_emits_heartbeat_only(self):
         cfg = ShimConfig(
             command="python3",
-            args=[str(FAKE_CLI), "--mode", "delayed-output", "--duration", "2.0"],
+            args=[str(FAKE_CLI), "--mode", "heartbeat-only", "--duration", "5.0"],
+            cwd=str(REPO_ROOT),
+            timeout=0.6,
+            heartbeat_wrap=False,
+        )
+
+        with pytest.raises(TimeoutError, match="idle for"):
+            list(stream_cli_prompt("ignored", cfg))
+
+    def test_heartbeat_wrap_does_not_mask_idle_timeout_on_silent_child(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "idle-silent", "--duration", "5.0"],
             cwd=str(REPO_ROOT),
             timeout=1.2,
+            heartbeat_wrap=True,
+            heartbeat_interval=0.3,
+        )
+
+        with pytest.raises(TimeoutError, match="idle for"):
+            list(stream_cli_prompt("ignored", cfg))
+
+    def test_heartbeat_wrap_strips_heartbeat_bytes_from_passed_through_output(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "stream-text"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
             heartbeat_wrap=True,
             heartbeat_interval=0.3,
         )
@@ -534,7 +571,7 @@ class TestRunner:
         events = list(stream_cli_prompt("ignored", cfg))
 
         text_payload = "".join(event.text or "" for event in events if event.kind == "text")
-        assert "delayed done" in text_payload
+        assert "Streaming hello from fake CLI" in text_payload
         assert "\u200b" not in text_payload
 
     def test_stream_cli_prompt_translates_argument_list_too_long_error(self):
