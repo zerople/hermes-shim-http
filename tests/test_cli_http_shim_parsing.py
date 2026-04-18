@@ -1,6 +1,11 @@
 import json
 
-from hermes_shim_http.parsing import IncrementalToolCallParser, parse_cli_output
+from hermes_shim_http.parsing import (
+    ClaudeStreamJsonParser,
+    IncrementalToolCallParser,
+    parse_claude_stream_json,
+    parse_cli_output,
+)
 
 
 def test_parse_plain_text_response():
@@ -104,3 +109,197 @@ def test_incremental_parser_hides_tool_call_wrapper_until_complete_block():
     assert rendered_text == "Before  after"
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "read_file"
+
+
+def _stream_json(*events: dict) -> str:
+    return "".join(json.dumps(ev) + "\n" for ev in events)
+
+
+def test_claude_stream_parser_emits_text_deltas():
+    parser = ClaudeStreamJsonParser()
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello "}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "world"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+
+    texts = [e.text for e in events if e.kind == "text"]
+    assert "".join(texts) == "Hello world"
+    assert not [e for e in events if e.kind == "tool_call"]
+
+
+def test_claude_stream_parser_ignores_thinking_delta():
+    parser = ClaudeStreamJsonParser()
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "secret"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+
+    assert events == []
+
+
+def test_claude_stream_parser_assembles_tool_use():
+    parser = ClaudeStreamJsonParser()
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                                           "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                           "delta": {"type": "input_json_delta", "partial_json": '{"pa'}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                           "delta": {"type": "input_json_delta", "partial_json": 'th":"README.md"}'}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    assert len(tool_events) == 1
+    tc = tool_events[0].tool_call
+    assert tc["id"] == "toolu_1"
+    assert tc["function"]["name"] == "read_file"
+    assert json.loads(tc["function"]["arguments"]) == {"path": "README.md"}
+
+
+def test_claude_stream_parser_handles_split_lines_across_feeds():
+    parser = ClaudeStreamJsonParser()
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}},
+    )
+    mid = len(blob) // 2
+    events = parser.feed(blob[:mid]) + parser.feed(blob[mid:]) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    assert "".join(texts) == "hi"
+
+
+def test_claude_stream_parser_ignores_malformed_json_lines():
+    parser = ClaudeStreamJsonParser()
+    blob = (
+        "not-json\n"
+        + json.dumps({"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}}) + "\n"
+        + json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}}}) + "\n"
+    )
+    events = parser.feed(blob) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    assert "".join(texts) == "ok"
+
+
+def test_claude_stream_parser_aggregate_fallback_when_no_stream_events():
+    parser = ClaudeStreamJsonParser()
+    blob = json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_1",
+            "content": [
+                {"type": "text", "text": "fallback text"},
+                {"type": "tool_use", "id": "toolu_x", "name": "read_file", "input": {"path": "README.md"}},
+            ],
+        },
+    }) + "\n"
+    events = parser.feed(blob) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    assert "".join(texts) == "fallback text"
+    assert len(tool_events) == 1
+    assert tool_events[0].tool_call["function"]["name"] == "read_file"
+
+
+def test_claude_stream_parser_suppresses_aggregate_when_stream_events_present():
+    parser = ClaudeStreamJsonParser()
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "streamed"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+        {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "streamed"}]}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    assert "".join(texts) == "streamed"
+
+
+def test_parse_claude_stream_json_whole_blob():
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    parsed = parse_claude_stream_json(blob)
+    assert parsed.content == "Hello"
+    assert parsed.tool_calls == []
+
+
+def test_parse_claude_stream_json_falls_back_to_plain_text_when_no_json():
+    # CLI profile is claude but the CLI happened to emit raw text (e.g. mocked
+    # run_cli_prompt, an unrecognised error path, or a legacy build). The shim
+    # must still extract content and tool-call tags rather than returning empty.
+    parsed = parse_claude_stream_json(
+        "Hello plain text\n"
+        '<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"/tmp/demo.txt\\"}"}}</tool_call>'
+    )
+    assert "Hello plain text" in parsed.content
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0]["function"]["name"] == "read_file"
+
+
+def test_claude_stream_parser_extracts_tool_call_tags_from_text_deltas():
+    # Hermes-style tool invocation: server injects `<tool_call>...</tool_call>`
+    # convention into the system prompt. Claude emits those tags inside text
+    # blocks via stream-json text_delta events. The parser must surface them
+    # as tool_call events, not raw text.
+    parser = ClaudeStreamJsonParser()
+    tag = (
+        '<tool_call>{"id":"call_1","type":"function",'
+        '"function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}'
+        '</tool_call>'
+    )
+    # Split the tag across multiple text_deltas to exercise the incremental path.
+    splits = [tag[:15], tag[15:60], tag[60:]]
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}},
+        *[
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": piece}}}
+            for piece in splits
+        ],
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    text_events = [e for e in events if e.kind == "text" and e.text]
+    assert len(tool_events) == 1
+    assert tool_events[0].tool_call["function"]["name"] == "read_file"
+    # The raw <tool_call> tag bytes must not leak through as text.
+    rendered = "".join(e.text for e in text_events)
+    assert "<tool_call>" not in rendered
+    assert "</tool_call>" not in rendered
+
+
+def test_claude_stream_parser_extracts_tool_call_tags_from_aggregate_text():
+    # Same tool-call-tag convention, but Claude emits only the aggregate
+    # `assistant` snapshot (no stream_event text_deltas arrived).
+    parser = ClaudeStreamJsonParser()
+    tag = (
+        'prefix '
+        '<tool_call>{"id":"call_1","type":"function",'
+        '"function":{"name":"search_files","arguments":"{\\"pattern\\":\\"TODO\\"}"}}'
+        '</tool_call>'
+        ' suffix'
+    )
+    blob = json.dumps({
+        "type": "assistant",
+        "message": {"id": "msg_1", "content": [{"type": "text", "text": tag}]},
+    }) + "\n"
+    events = parser.feed(blob) + parser.finalize()
+
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    text_events = [e for e in events if e.kind == "text" and e.text]
+    assert len(tool_events) == 1
+    assert tool_events[0].tool_call["function"]["name"] == "search_files"
+    rendered = "".join(e.text for e in text_events)
+    assert "<tool_call>" not in rendered
+    assert "prefix" in rendered and "suffix" in rendered

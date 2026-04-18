@@ -218,6 +218,10 @@ class TestRunner:
             "claude",
             "-p",
             "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
         ]
@@ -238,6 +242,10 @@ class TestRunner:
             "claude",
             "-p",
             "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--resume",
             "22222222-2222-2222-2222-222222222222",
             "--fork-session",
@@ -259,6 +267,10 @@ class TestRunner:
             "claude",
             "-p",
             "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
             "--model",
@@ -276,6 +288,10 @@ class TestRunner:
             "claude",
             "-p",
             "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
         ]
@@ -693,6 +709,41 @@ class TestRunner:
         assert len(tool_call_events) == 1
         assert text_payload == ""
         assert tool_call_events[0].tool_call["function"]["name"] == "read_file"
+
+    def test_stream_cli_prompt_parses_claude_stream_json_events(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-stream-json"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            heartbeat_wrap=False,
+            cli_profile="claude",
+        )
+
+        events = list(stream_cli_prompt("say hello", cfg))
+
+        texts = [e.text for e in events if e.kind == "text"]
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        assert "".join(texts) == "Streaming hello from claude"
+        assert tool_calls == []
+
+    def test_stream_cli_prompt_claude_stream_json_emits_tool_use(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-stream-json"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            heartbeat_wrap=False,
+            cli_profile="claude",
+        )
+
+        events = list(stream_cli_prompt("please read the readme", cfg))
+
+        tool_calls = [e for e in events if e.kind == "tool_call"]
+        texts = [e.text for e in events if e.kind == "text"]
+        assert "".join(texts) == ""
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool_call["function"]["name"] == "read_file"
 
 
 class TestSessionCache:

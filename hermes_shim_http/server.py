@@ -16,10 +16,11 @@ from pydantic import ValidationError
 
 from . import __version__
 from .logging_utils import configure_logger, emit_log
+from .inflight import InFlightRegistry
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
-from .parsing import IncrementalToolCallParser, parse_cli_output
+from .parsing import IncrementalToolCallParser
 from .prompting import build_cli_prompt, compact_messages
-from .runner import resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
+from .runner import parse_cli_result, resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
 from .silence import detect_and_strip as _detect_silent, silent_sentinel
 from .slash_commands import dispatch_slash_command
@@ -124,6 +125,37 @@ def _silent_headers(parsed: ParsedShimOutput, headers: dict[str, str]) -> dict[s
     if parsed.silent:
         return {**headers, SILENT_HEADER: "true"}
     return headers
+
+
+def _idempotency_key(http_request: Request) -> str:
+    raw = (
+        http_request.headers.get("Idempotency-Key")
+        or http_request.headers.get("X-Idempotency-Key")
+        or http_request.headers.get("X-Request-Id")
+        or ""
+    )
+    return raw.strip()
+
+
+def _release_on_exit(gen: Iterator[bytes], registry: InFlightRegistry, key: str) -> Iterator[bytes]:
+    try:
+        yield from gen
+    finally:
+        registry.release(key)
+
+
+def _duplicate_request_response(key: str, request_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "message": "duplicate in-flight request for idempotency key",
+                "type": "duplicate_request",
+                "idempotency_key": key,
+            }
+        },
+        headers={"X-Request-Id": request_id, "X-Idempotency-Key": key, "Retry-After": "5"},
+    )
 
 
 def _assistant_messages_from_parsed(parsed: ParsedShimOutput) -> list[dict[str, Any]]:
@@ -860,6 +892,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
     app.state.started_at = time.time()
     app.state.metrics = {"request_count": 0, "cache_hits": 0, "cache_misses": 0, "total_latency_ms": 0.0, "token_context_total": 0, "token_context_max": 0, "token_response_total": 0, "compactions": 0}
     app.state.pending_compactions = {}
+    app.state.in_flight = InFlightRegistry()
     logger = configure_logger(log_level=cfg.log_level, log_format=cfg.log_format, logger_name=f"hermes_shim_http.{id(app)}")
 
     def _context_window_for(model: str) -> int:
@@ -989,7 +1022,8 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionsRequest, http_request: Request) -> Any:
-        request_id = uuid.uuid4().hex
+        idempotency_key = _idempotency_key(http_request)
+        request_id = idempotency_key or uuid.uuid4().hex
         request_messages = [message.model_dump() for message in request.messages]
         last_user_text = _extract_last_user_text(request_messages)
         slash = dispatch_slash_command(last_user_text or "", model=request.model, stats=_debug_stats_payload(app)) if last_user_text else None
@@ -1012,6 +1046,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             usage = estimate_token_usage(messages=request_messages, response_text=response_text)
             payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
+
+        if idempotency_key and not app.state.in_flight.reserve(idempotency_key):
+            emit_log(logger, event="duplicate_request", request_id=request_id, model=request.model, idempotency_key=idempotency_key)
+            return _duplicate_request_response(idempotency_key, request_id)
 
         compaction_token = http_request.headers.get("X-Compaction-Token")
         effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=request_messages, model=request.model)
@@ -1039,8 +1077,9 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if request.stream:
             emit_log(logger, event="spawn", request_id=request_id, model=request.model, stream=True)
+            inner_stream = _stream_live_chat_chunks(app=app, request_id=request_id, logger=logger, model=request.model, request_messages=compacted_messages, prompt=session_plan.prompt_text, config=cfg, allowed_tool_names=allowed_tool_names, session_plan=session_plan, session_cache=session_cache, compacted=compacted)
             return StreamingResponse(
-                _stream_live_chat_chunks(app=app, request_id=request_id, logger=logger, model=request.model, request_messages=compacted_messages, prompt=session_plan.prompt_text, config=cfg, allowed_tool_names=allowed_tool_names, session_plan=session_plan, session_cache=session_cache, compacted=compacted),
+                _release_on_exit(inner_stream, app.state.in_flight, idempotency_key),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **headers},
             )
@@ -1056,7 +1095,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 system_prompt=session_plan.system_prompt_text,
                 model=request.model,
             )
-            parsed = _sanitize_parsed_output(parse_cli_output(result.stdout), allowed_tool_names)
+            parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
             session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
             usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
             _record_metrics(app, latency_ms=max(result.duration_ms, int((time.time() - started) * 1000)), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
@@ -1072,8 +1111,9 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             return {"error": {"message": str(exc), "type": "shim_error"}}
 
         if cfg.http_heartbeat_interval > 0:
+            heartbeat_stream = _streaming_json_with_heartbeat(_run_chat, interval=cfg.http_heartbeat_interval, on_error=_on_chat_error)
             return StreamingResponse(
-                _streaming_json_with_heartbeat(_run_chat, interval=cfg.http_heartbeat_interval, on_error=_on_chat_error),
+                _release_on_exit(heartbeat_stream, app.state.in_flight, idempotency_key),
                 media_type="application/json",
                 headers=headers,
             )
@@ -1082,10 +1122,13 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            app.state.in_flight.release(idempotency_key)
 
     @app.post("/v1/responses")
     def responses(body: dict[str, Any], http_request: Request) -> Any:
-        request_id = uuid.uuid4().hex
+        idempotency_key = _idempotency_key(http_request)
+        request_id = idempotency_key or uuid.uuid4().hex
         model = str(body.get("model") or (cfg.models[0] if cfg.models else "cli-http-shim"))
         try:
             raw_messages = _normalize_responses_input(body.get("input"))
@@ -1113,6 +1156,10 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
 
+        if idempotency_key and not app.state.in_flight.reserve(idempotency_key):
+            emit_log(logger, event="duplicate_request", request_id=request_id, model=model, idempotency_key=idempotency_key)
+            return _duplicate_request_response(idempotency_key, request_id)
+
         compaction_token = http_request.headers.get("X-Compaction-Token")
         effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=raw_messages, model=model)
         body_for_prompt = {**body, "input": effective_messages}
@@ -1125,8 +1172,9 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if body.get("stream"):
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=True)
+            inner_stream = _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, compacted=compacted)
             return StreamingResponse(
-                _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, compacted=compacted),
+                _release_on_exit(inner_stream, app.state.in_flight, idempotency_key),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **headers},
             )
@@ -1151,8 +1199,9 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             return {"error": {"message": str(exc), "type": "shim_error"}}
 
         if cfg.http_heartbeat_interval > 0:
+            heartbeat_stream = _streaming_json_with_heartbeat(_run_responses, interval=cfg.http_heartbeat_interval, on_error=_on_responses_error)
             return StreamingResponse(
-                _streaming_json_with_heartbeat(_run_responses, interval=cfg.http_heartbeat_interval, on_error=_on_responses_error),
+                _release_on_exit(heartbeat_stream, app.state.in_flight, idempotency_key),
                 media_type="application/json",
                 headers=headers,
             )
@@ -1161,6 +1210,8 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            app.state.in_flight.release(idempotency_key)
 
     return app
 

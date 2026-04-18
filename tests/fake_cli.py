@@ -2,8 +2,57 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+
+
+def _emit_claude_event(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _emit_claude_stream_json(prompt: str) -> None:
+    _emit_claude_event({"type": "system", "subtype": "init", "session_id": "fake-session"})
+    _emit_claude_event({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "msg_fake"}}})
+
+    if "read the readme" in prompt.lower():
+        _emit_claude_event({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file"}},
+        })
+        for partial in ['{"pa', 'th":"R', 'EADME.md"}']:
+            _emit_claude_event({
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "input_json_delta", "partial_json": partial}},
+            })
+        _emit_claude_event({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}})
+    else:
+        _emit_claude_event({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}},
+        })
+        _emit_claude_event({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "thinking_delta", "thinking": "pondering"}},
+        })
+        _emit_claude_event({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}})
+        _emit_claude_event({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "text"}},
+        })
+        for piece in ["Streaming ", "hello ", "from ", "claude"]:
+            _emit_claude_event({
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "index": 1,
+                          "delta": {"type": "text_delta", "text": piece}},
+            })
+        _emit_claude_event({"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}})
+
+    _emit_claude_event({"type": "result", "subtype": "success"})
 
 
 def main() -> int:
@@ -11,9 +60,30 @@ def main() -> int:
     parser.add_argument("--mode", default="legacy")
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Sleep duration for idle-silent / delayed-output modes.")
+    # Accept Claude CLI flags so fake_cli can be invoked with the real claude
+    # profile argv without choking the argparse step.
+    parser.add_argument("-p", action="store_true")
+    parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--output-format", default=None)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--include-partial-messages", action="store_true")
+    parser.add_argument("--append-system-prompt", default=None)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--fallback-model", default=None)
+    parser.add_argument("--session-id", default=None)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--fork-session", action="store_true")
     parser.add_argument("prompt", nargs="?")
     args = parser.parse_args()
     prompt = args.prompt or ""
+    # Claude profile pipes the prompt via stdin; read it opportunistically.
+    if not prompt and not sys.stdin.isatty():
+        try:
+            stdin_text = sys.stdin.read()
+        except Exception:
+            stdin_text = ""
+        if stdin_text:
+            prompt = stdin_text
 
     if args.mode == "stream-text":
         for chunk in ["Streaming ", "hello ", "from ", "fake CLI"]:
@@ -63,6 +133,10 @@ def main() -> int:
             print(f"tick {i}", flush=True)
             time.sleep(0.1)
             i += 1
+        return 0
+
+    if args.mode == "claude-stream-json":
+        _emit_claude_stream_json(prompt)
         return 0
 
     if args.mode == "flood":

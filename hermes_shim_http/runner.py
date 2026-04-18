@@ -9,8 +9,13 @@ import threading
 import time
 from typing import Iterator, List
 
-from .models import CliRunResult, CliStreamEvent, ShimConfig
-from .parsing import IncrementalToolCallParser
+from .models import CliRunResult, CliStreamEvent, ParsedShimOutput, ShimConfig
+from .parsing import (
+    ClaudeStreamJsonParser,
+    IncrementalToolCallParser,
+    parse_claude_stream_json,
+    parse_cli_output,
+)
 from .telemetry import emit_event
 
 
@@ -44,7 +49,14 @@ def _resolved_args(config: ShimConfig) -> list[str]:
         return list(config.args)
 
     return {
-        "claude": ["-p", "--dangerously-skip-permissions"],
+        "claude": [
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ],
         "codex": ["exec"],
         "opencode": ["run"],
         "generic": [],
@@ -53,6 +65,13 @@ def _resolved_args(config: ShimConfig) -> list[str]:
 
 def _pipes_prompt_via_stdin(config: ShimConfig) -> bool:
     return _resolved_profile(config) == "claude"
+
+
+def parse_cli_result(result: CliRunResult, config: ShimConfig) -> ParsedShimOutput:
+    """Parse CLI stdout using the profile-appropriate parser."""
+    if _resolved_profile(config) == "claude":
+        return parse_claude_stream_json(result.stdout)
+    return parse_cli_output(result.stdout)
 
 
 def supports_cli_resume(config: ShimConfig) -> bool:
@@ -432,7 +451,7 @@ def stream_cli_prompt(
     total_bytes = 0
     max_bytes = config.max_output_bytes
     hard_deadline = config.hard_deadline_seconds
-    parser = IncrementalToolCallParser()
+    parser = ClaudeStreamJsonParser() if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
 
     stdout_thread = threading.Thread(
         target=_pump_stream,

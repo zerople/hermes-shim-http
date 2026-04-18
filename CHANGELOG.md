@@ -2,6 +2,16 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.15] - 2026-04-18
+
+### Fixed
+- **Silent `-p` text mode triggered `RemoteProtocolError` on long Claude reasoning turns (P0).** The Claude profile invoked the CLI with plain `-p` / `--dangerously-skip-permissions`, which only prints text once the final reply is ready. During multi-minute extended-thinking turns the child emitted nothing to stdout; only the U+200B heartbeat kept the shim alive, and the HTTP caller saw `: ping` comments for 50+ minutes before Hermes tore down the connection with `RemoteProtocolError → Reconnecting (attempt 2/3)`. The retry then re-entered the same turn and risked duplicate agent work (phantom duplicate task IDs, ghost worktrees).
+- **Claude profile now uses `--output-format stream-json --verbose --include-partial-messages`** so the child emits incremental NDJSON (`stream_event` → `content_block_delta`) throughout the turn. A new `ClaudeStreamJsonParser` assembles text, thinking, and `tool_use` blocks into the shim's `CliStreamEvent` pipeline; `parse_claude_stream_json` falls back to legacy `<tool_call>` text parsing when the blob contains no JSON lines so existing mocks and non-Claude profiles remain unaffected. `thinking_delta` / `signature_delta` events are consumed silently (raw bytes still reset the runner idle timer).
+
+### Added
+- **Idempotency-key retry guard.** New `InFlightRegistry` tracks reservations keyed by the `Idempotency-Key`, `X-Idempotency-Key`, or `X-Request-Id` header. A second request arriving while the first is still streaming for the same key is rejected with `409 duplicate_request` (and `Retry-After: 5`) instead of spawning a second child CLI. Reservations release automatically when the response finishes, errors, or the client disconnects — covering the exact Hermes retry window (`RemoteProtocolError → attempt 2/3`) that previously double-spent tokens and risked duplicate task work. Covered by `tests/test_idempotency.py`.
+- **`heartbeat-wrap.py` stderr serialization.** The periodic U+200B heartbeat no longer interleaves mid-line with real stderr bytes — writes now share a lock with the stderr pump so concatenated streams remain cleanly decodable.
+
 ## [0.1.14] - 2026-04-18
 
 ### Fixed
