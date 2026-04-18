@@ -2,6 +2,17 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.11] - 2026-04-18
+
+### Changed
+- CI: bumped `actions/setup-node` to Node 24.
+- CI: switched npm publish to classic token auth (`NPM_TOKEN` → `NODE_AUTH_TOKEN`) and removed `--provenance` since trusted publishing is not yet linked on the npm package side.
+
+## [0.1.10] - 2026-04-17
+
+### Fixed
+- Buffer streaming response text until the `<silent/>` sentinel is ruled out so silent-ACK turns never leak the literal sentinel through SSE deltas.
+
 ## [0.1.9] - 2026-04-17
 
 ### Added

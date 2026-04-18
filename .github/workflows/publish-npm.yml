@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
       - uses: actions/setup-python@v5
         with:
@@ -67,4 +67,6 @@ jobs:
       - name: Launcher smoke test
         run: node bin/hermes-shim-http.js --help
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
