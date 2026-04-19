@@ -22,8 +22,6 @@ from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, Sh
 from .parsing import IncrementalToolCallParser
 from .prompting import build_cli_system_prompt, build_cli_user_prompt, compact_messages
 from .runner import parse_cli_result, resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
-from .session_cache import SessionCache, SessionPlan
-from .silence import detect_and_strip as _detect_silent, silent_sentinel
 from .slash_commands import dispatch_slash_command
 from .telemetry import emit_event
 from .token_usage import TokenUsageEstimate, context_limit_for_model, estimate_token_usage
@@ -1206,7 +1204,6 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 system_prompt=session_plan.system_prompt_text,
                 model=request.model,
                 disable_builtin_tools=bool(allowed_tool_names),
-            )
             parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
             session_cache.record_success(
                 session_plan,
