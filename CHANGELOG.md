@@ -2,6 +2,17 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.17] - 2026-04-18
+
+### Changed
+- **Claude native I/O now runs fully on stream-json.** The native `claude` path now forces both `--output-format stream-json` and `--input-format stream-json`, and stdin is sent as a structured Claude user event JSON line instead of raw text. This aligns the shim with Claude's event protocol and keeps long-lived runs structurally streamable in both directions.
+- **Protocol-critical Claude args are now shielded from custom overrides.** User-supplied Claude args can no longer silently replace `-p/--print`, `--output-format`, `--input-format`, or `--permission-mode`, preventing accidental downgrade back to text mode or other transport breakage.
+- **Opus is now treated as a 1M-context model across the shim.** `/v1/models`, `/v1/info`, compaction thresholds, and usage accounting all use a 1,000,000 token context window for Opus instead of the old 200k Claude default.
+- **First live user instruction is now pinned through compaction.** The shim system prompt and Claude bootstrap prompt both explicitly state that the VERY FIRST live user message is the highest-priority session instruction even if later context is summarized or compacted, and compaction now injects a pinned synthetic system message so that instruction survives window/summarize trimming.
+
+### Fixed
+- **Resume failure no longer poisons stored Claude session IDs.** When a resumed Claude run fails and emits a fresh session ID instead of the requested parent session, the shim now discards that mismatched ID rather than recording it as if resume had succeeded. Successful runs still preserve the emitted Claude session ID and write it back into the session cache.
+
 ## [0.1.16] - 2026-04-18
 
 ### Fixed

@@ -6,8 +6,9 @@ import pytest
 from pydantic import ValidationError
 
 from hermes_shim_http.models import CliRunResult, ShimConfig
+from hermes_shim_http.parsing import parse_claude_stream_metadata
 from hermes_shim_http.prompting import build_cli_prompt, build_cli_system_prompt, build_cli_user_prompt
-from hermes_shim_http.runner import build_cli_command, run_cli_prompt, stream_cli_prompt
+from hermes_shim_http.runner import _child_lock_path_for_request, _resolve_claude_result_session_id, build_cli_command, run_cli_prompt, stream_cli_prompt
 from hermes_shim_http.session_cache import SessionCache
 
 
@@ -53,6 +54,35 @@ class TestPrompting:
 
         assert "<silent/>" in system_prompt
         assert "silent ACK" in system_prompt
+
+    def test_build_cli_system_prompt_prioritizes_first_live_user_message(self):
+        system_prompt = build_cli_system_prompt(tools=None)
+
+        assert "VERY FIRST live user message after the session opens" in system_prompt
+        assert "highest-priority instruction" in system_prompt
+        assert "Even if earlier context is summarized or compacted" in system_prompt
+
+    def test_parse_claude_stream_metadata_extracts_session_and_result(self):
+        metadata = parse_claude_stream_metadata(
+            '{"type":"system","session_id":"sess-1"}\n'
+            '{"type":"result","session_id":"sess-2","result":"boom","is_error":true}\n'
+        )
+
+        assert metadata.session_id == "sess-2"
+        assert metadata.result_text == "boom"
+        assert metadata.is_error is True
+
+    def test_resolve_claude_result_session_id_drops_mismatched_failed_resume(self):
+        assert _resolve_claude_result_session_id(
+            requested_resume_session_id="parent-1",
+            emitted_session_id="fresh-2",
+            failed=True,
+        ) is None
+        assert _resolve_claude_result_session_id(
+            requested_resume_session_id="parent-1",
+            emitted_session_id="fresh-2",
+            failed=False,
+        ) == "fresh-2"
 
     def test_build_cli_system_prompt_uses_configured_silence_sentinel(self, monkeypatch):
         monkeypatch.setenv("HERMES_SHIM_SILENT_SENTINEL", "<<<HUSH>>>")
@@ -151,7 +181,7 @@ class TestPrompting:
         assert "Assistant:" not in prompt
 
 
-_CLAUDE_APPEND_PROMPT = "Be concise and follow the user's instructions exactly."
+_CLAUDE_APPEND_PROMPT = "Be concise. You must follow the VERY FIRST live user message after the session opens as the highest-priority instruction for the session. Do not ignore or drift away from that first live user message, even if later transcript context is long, distracting, summarized, or compacted."
 
 
 class TestRunner:
@@ -209,6 +239,13 @@ class TestRunner:
         assert cmd == [
             "claude",
             "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
         ]
@@ -220,6 +257,8 @@ class TestRunner:
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",
+            "--input-format",
+            "stream-json",
             "--verbose",
             "--include-partial-messages",
             "--append-system-prompt",
@@ -227,6 +266,27 @@ class TestRunner:
         ]
         assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
         assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
+
+    def test_build_cli_command_filters_protocol_breaking_custom_claude_args(self):
+        cfg = ShimConfig(command="claude", args=["--output-format", "text", "--input-format=text", "--permission-mode", "plan", "--model", "opus"], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello")
+
+        assert cmd == [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            _CLAUDE_APPEND_PROMPT,
+        ]
 
     def test_build_cli_command_uses_append_only_for_new_claude_session(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
@@ -243,6 +303,8 @@ class TestRunner:
             "-p",
             "--dangerously-skip-permissions",
             "--output-format",
+            "stream-json",
+            "--input-format",
             "stream-json",
             "--verbose",
             "--include-partial-messages",
@@ -269,6 +331,8 @@ class TestRunner:
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",
+            "--input-format",
+            "stream-json",
             "--verbose",
             "--include-partial-messages",
             "--append-system-prompt",
@@ -289,6 +353,8 @@ class TestRunner:
             "-p",
             "--dangerously-skip-permissions",
             "--output-format",
+            "stream-json",
+            "--input-format",
             "stream-json",
             "--verbose",
             "--include-partial-messages",
@@ -316,17 +382,26 @@ class TestRunner:
         assert result.stdout == "done"
         assert result.stderr == ""
         assert result.exit_code == 0
+        assert result.session_id is None
         mock_drain.assert_called_once_with(
             [
                 "claude",
                 "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
                 "--append-system-prompt",
                 _CLAUDE_APPEND_PROMPT,
                 "--model",
                 "sonnet",
             ],
             config=cfg,
-            stdin_prompt="Be terse.\n\nhello",
+            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n',
+            lock_path=None,
         )
 
     def test_run_cli_prompt_omits_large_system_prompt_from_resumed_claude_stdin(self):
@@ -349,6 +424,13 @@ class TestRunner:
             [
                 "claude",
                 "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
                 "--model",
                 "sonnet",
                 "--resume",
@@ -358,8 +440,34 @@ class TestRunner:
                 "11111111-1111-1111-1111-111111111111",
             ],
             config=cfg,
-            stdin_prompt="<user>\ncontinue\n</user>",
+            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<user>\\ncontinue\\n</user>"}]}}\n',
+            lock_path=None,
         )
+
+    def test_run_cli_prompt_preserves_emitted_session_id_on_success(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        stdout = '{"type":"system","session_id":"sess-1"}\n{"type":"result","session_id":"sess-1","result":"done","is_error":false}\n'
+
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=(stdout, "", 0),
+        ):
+            result = run_cli_prompt("hello", cfg, resume_session_id="parent-1")
+
+        assert result.session_id == "sess-1"
+
+    def test_run_cli_prompt_drops_mismatched_failed_resume_session_id(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
+        stdout = '{"type":"system","session_id":"fresh-2"}\n{"type":"result","session_id":"fresh-2","result":"No conversation found","is_error":true}\n'
+
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=(stdout, "boom", 1),
+        ):
+            with pytest.raises(RuntimeError, match="boom") as exc_info:
+                run_cli_prompt("hello", cfg, resume_session_id="parent-1")
+
+        assert "boom" in str(exc_info.value)
 
     def test_run_cli_prompt_raises_on_non_zero_exit(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
@@ -380,6 +488,40 @@ class TestRunner:
         ):
             with pytest.raises(TimeoutError, match="idle for"):
                 run_cli_prompt("hello", cfg)
+
+    def test_child_lock_path_is_disabled_for_new_sessions(self):
+        cfg = ShimConfig(command="claude", single_child_lock_path="/tmp/hermes-shim-http-8765.child.lock")
+
+        assert _child_lock_path_for_request(cfg, session_id="new-session", resume_session_id=None) is None
+
+    def test_child_lock_path_is_scoped_to_resumed_parent_session(self):
+        cfg = ShimConfig(command="claude", single_child_lock_path="/tmp/hermes-shim-http-8765.child.lock")
+
+        first = _child_lock_path_for_request(cfg, session_id="child-a", resume_session_id="parent-1")
+        second = _child_lock_path_for_request(cfg, session_id="child-b", resume_session_id="parent-1")
+        other = _child_lock_path_for_request(cfg, session_id="child-c", resume_session_id="parent-2")
+
+        assert first == second
+        assert first != other
+        assert first.startswith("/tmp/hermes-shim-http-8765.child.lock.")
+
+    def test_run_cli_prompt_passes_session_scoped_lock_path_to_drain(self):
+        cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0, single_child_lock_path="/tmp/hermes-shim-http-8765.child.lock")
+
+        with patch(
+            "hermes_shim_http.runner._drain_cli_process",
+            return_value=("done", "", 0),
+        ) as mock_drain:
+            run_cli_prompt(
+                "<user>\ncontinue\n</user>",
+                cfg,
+                system_prompt="VERY LONG SYSTEM",
+                model="sonnet",
+                session_id="11111111-1111-1111-1111-111111111111",
+                resume_session_id="parent-session-2222",
+            )
+
+        assert mock_drain.call_args.kwargs["lock_path"] == "/tmp/hermes-shim-http-8765.child.lock.parent-session-2222"
 
     def test_run_cli_prompt_raises_idle_timeout_when_child_emits_heartbeat_only(self):
         cfg = ShimConfig(
@@ -446,11 +588,18 @@ class TestRunner:
             events = list(stream_cli_prompt("hello", cfg, system_prompt="Be terse."))
 
         assert events == []
-        assert fake_process.stdin.value == b"Be terse.\n\nhello"
+        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n'
         mock_popen.assert_called_once_with(
             [
                 "claude",
                 "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
                 "--append-system-prompt",
                 _CLAUDE_APPEND_PROMPT,
             ],
@@ -513,11 +662,18 @@ class TestRunner:
             )
 
         assert events == []
-        assert fake_process.stdin.value == b"<user>\ncontinue\n</user>"
+        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "<user>\\ncontinue\\n</user>"}]}}\n'
         mock_popen.assert_called_once_with(
             [
                 "claude",
                 "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
                 "--model",
                 "sonnet",
                 "--resume",

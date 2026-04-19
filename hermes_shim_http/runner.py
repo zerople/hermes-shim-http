@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import codecs
 import errno
+import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -14,14 +16,23 @@ from .parsing import (
     ClaudeStreamJsonParser,
     IncrementalToolCallParser,
     parse_claude_stream_json,
+    parse_claude_stream_metadata,
     parse_cli_output,
 )
 from .single_child import ChildLockBusy, acquire_single_child_lock
 from .telemetry import emit_event
 
+_CLAUDE_BLOCKED_ARG_MODES = {
+    "-p": "standalone",
+    "--print": "standalone",
+    "--output-format": "value",
+    "--input-format": "value",
+    "--permission-mode": "value",
+}
+
 
 _DEFAULT_CHUNK_SIZE = 4096
-_CLAUDE_APPEND_SYSTEM_PROMPT = "Be concise and follow the user's instructions exactly."
+_CLAUDE_APPEND_SYSTEM_PROMPT = "Be concise. You must follow the VERY FIRST live user message after the session opens as the highest-priority instruction for the session. Do not ignore or drift away from that first live user message, even if later transcript context is long, distracting, summarized, or compacted."
 _HEARTBEAT_CHAR = "\u200b"
 _HEARTBEAT_WRAPPER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -45,23 +56,37 @@ def _resolved_profile(config: ShimConfig) -> str:
     return profile
 
 
-def _resolved_args(config: ShimConfig) -> list[str]:
-    if config.args:
-        return list(config.args)
+def _uses_native_claude_cli(config: ShimConfig) -> bool:
+    return _resolved_profile(config) == "claude" and _command_basename(config.command) == "claude"
 
-    return {
-        "claude": [
+
+def _resolved_args(config: ShimConfig) -> list[str]:
+    profile = _resolved_profile(config)
+    if profile == "claude":
+        if not _uses_native_claude_cli(config):
+            return list(config.args)
+        fixed = [
             "-p",
             "--dangerously-skip-permissions",
             "--output-format",
             "stream-json",
+            "--input-format",
+            "stream-json",
             "--verbose",
             "--include-partial-messages",
-        ],
+        ]
+        if not config.args:
+            return fixed
+        return [*fixed, *_filter_claude_custom_args(config.args)]
+
+    if config.args:
+        return list(config.args)
+
+    return {
         "codex": ["exec"],
         "opencode": ["run"],
         "generic": [],
-    }[_resolved_profile(config)]
+    }[profile]
 
 
 def _pipes_prompt_via_stdin(config: ShimConfig) -> bool:
@@ -90,6 +115,49 @@ def _is_meaningful_model(model: str | None) -> bool:
     if not value:
         return False
     return value not in {"cli-http-shim", "default", "auto"}
+
+
+def _filter_claude_custom_args(args: list[str]) -> list[str]:
+    filtered: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        flag = arg
+        has_inline_value = False
+        if "=" in arg:
+            flag = arg.split("=", 1)[0]
+            has_inline_value = True
+        mode = _CLAUDE_BLOCKED_ARG_MODES.get(flag)
+        if mode:
+            if mode == "value" and not has_inline_value:
+                skip_next = True
+            continue
+        filtered.append(arg)
+    return filtered
+
+
+def _build_claude_stdin_payload(prompt_text: str) -> str:
+    payload = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt_text,
+                }
+            ],
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _resolve_claude_result_session_id(*, requested_resume_session_id: str | None, emitted_session_id: str | None, failed: bool) -> str | None:
+    if failed and requested_resume_session_id and emitted_session_id and emitted_session_id != requested_resume_session_id:
+        return None
+    return emitted_session_id
 
 
 def _log_cli_dispatch(
@@ -126,8 +194,9 @@ def _stdin_prompt_text(
     system_prompt: str | None = None,
     resume_session_id: str | None = None,
 ) -> str:
-    if _resolved_profile(config) == "claude" and resume_session_id:
-        return prompt_text
+    if _resolved_profile(config) == "claude":
+        payload_text = prompt_text if resume_session_id else _combine_prompt_text(prompt_text, system_prompt=system_prompt)
+        return _build_claude_stdin_payload(payload_text)
     return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
 
 
@@ -145,6 +214,8 @@ def build_cli_command(
 
     if _resolved_profile(config) == "claude":
         command = list(base)
+        if not _uses_native_claude_cli(config):
+            return command
         if not resume_session_id:
             command.extend(["--append-system-prompt", _CLAUDE_APPEND_SYSTEM_PROMPT])
         if _is_meaningful_model(model):
@@ -179,6 +250,26 @@ def _translate_spawn_oserror(exc: OSError, *, command: str) -> RuntimeError:
     return RuntimeError(f"Failed to start CLI process '{command}': {exc}")
 
 
+def _sanitize_lock_key(lock_key: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", (lock_key or "").strip())
+    sanitized = sanitized.strip("._")
+    return sanitized or "request"
+
+
+def _child_lock_path_for_request(
+    config: ShimConfig,
+    *,
+    session_id: str | None = None,
+    resume_session_id: str | None = None,
+) -> str | None:
+    base_path = (config.single_child_lock_path or "").strip()
+    if not base_path:
+        return None
+    if not resume_session_id:
+        return None
+    return f"{base_path}.{_sanitize_lock_key(resume_session_id)}"
+
+
 def run_cli_prompt(
     prompt_text: str,
     config: ShimConfig,
@@ -209,6 +300,11 @@ def run_cli_prompt(
         command,
         config=config,
         stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
+        lock_path=_child_lock_path_for_request(
+            config,
+            session_id=session_id,
+            resume_session_id=resume_session_id,
+        ),
     )
     duration_ms = int((time.time() - started) * 1000)
     result = CliRunResult(
@@ -216,6 +312,15 @@ def run_cli_prompt(
         stderr=stderr_text,
         exit_code=exit_code,
         duration_ms=duration_ms,
+        session_id=(
+            _resolve_claude_result_session_id(
+                requested_resume_session_id=resume_session_id,
+                emitted_session_id=parse_claude_stream_metadata(stdout_text).session_id,
+                failed=exit_code != 0 or parse_claude_stream_metadata(stdout_text).is_error,
+            )
+            if _resolved_profile(config) == "claude"
+            else None
+        ),
     )
     if result.exit_code != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.exit_code}"
@@ -241,8 +346,9 @@ def _drain_cli_process(
     *,
     config: ShimConfig,
     stdin_prompt: str | None,
+    lock_path: str | None = None,
 ) -> tuple[str, str, int]:
-    with acquire_single_child_lock(config.single_child_lock_path or ""):
+    with acquire_single_child_lock(lock_path or ""):
         return _drain_cli_process_inner(command, config=config, stdin_prompt=stdin_prompt)
 
 
@@ -410,7 +516,12 @@ def stream_cli_prompt(
     system_prompt: str | None = None,
     model: str | None = None,
 ) -> Iterator[CliStreamEvent]:
-    with acquire_single_child_lock(config.single_child_lock_path or ""):
+    lock_path = _child_lock_path_for_request(
+        config,
+        session_id=session_id,
+        resume_session_id=resume_session_id,
+    )
+    with acquire_single_child_lock(lock_path or ""):
         yield from _stream_cli_prompt_inner(
             prompt_text,
             config,

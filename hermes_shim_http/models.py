@@ -43,6 +43,7 @@ class CliRunResult(BaseModel):
     stderr: str = ""
     exit_code: int
     duration_ms: int
+    session_id: Optional[str] = None
 
 
 class CliStreamEvent(BaseModel):

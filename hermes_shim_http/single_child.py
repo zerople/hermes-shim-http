@@ -1,10 +1,10 @@
-"""Single-instance child-spawn lock.
+"""Child-spawn lock helper.
 
-Ensures only one CLI child process runs at a time. When a second spawn is
-requested while a child is still alive, the lock attempt fails immediately
-(non-blocking). The HTTP layer maps this to 409 instead of spawning a
-phantom sibling — preventing the race where two claude CLI children write
-concurrently to the same disk SSOT (autonomous.json, .lck/, worktree files).
+The runner derives a request-scoped lock path and acquires it non-blockingly.
+In the current shim design, only resumed requests for the same parent session
+share a lock path; fresh sessions do not serialize globally. This prevents two
+children from forking the same parent session concurrently across retries or
+multi-process deployments.
 """
 
 from __future__ import annotations

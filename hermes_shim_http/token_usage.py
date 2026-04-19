@@ -7,6 +7,20 @@ from typing import Any
 DEFAULT_CONTEXT_LIMIT = 8192
 
 
+def context_limit_for_model(model: str | None, *, profile: str | None = None) -> int:
+    name = (model or "").strip().lower()
+    profile_name = (profile or "").strip().lower()
+    if "opus" in name:
+        return 1_000_000
+    if profile_name == "claude" or "claude" in name or name in {"sonnet", "haiku"}:
+        return 200_000
+    if profile_name == "codex" or "gpt-" in name or "codex" in name:
+        return 400_000
+    if profile_name == "opencode":
+        return 200_000
+    return 128_000
+
+
 @dataclass(frozen=True, slots=True)
 class TokenUsageEstimate:
     context_tokens_used: int

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from dataclasses import dataclass
 
 from .models import CliStreamEvent, ParsedShimOutput
 from .silence import detect_and_strip as _detect_silent
@@ -12,6 +13,13 @@ _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_CLOSE = "</tool_call>"
 
 _CLAUDE_IGNORED_DELTA_TYPES = frozenset({"thinking_delta", "signature_delta"})
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeResultMetadata:
+    session_id: str | None = None
+    result_text: str = ""
+    is_error: bool = False
 
 
 def _normalize_tool_call(raw_obj: dict[str, Any], index: int) -> dict[str, Any] | None:
@@ -136,9 +144,19 @@ class ClaudeStreamJsonParser:
         self._saw_stream_events = False
         self._saw_any_json = False
         self._tag_parser = IncrementalToolCallParser()
+        self._session_id: str | None = None
+        self._result_text = ""
+        self._result_is_error = False
 
     def saw_any_json(self) -> bool:
         return self._saw_any_json
+
+    def result_metadata(self) -> ClaudeResultMetadata:
+        return ClaudeResultMetadata(
+            session_id=self._session_id,
+            result_text=self._result_text,
+            is_error=self._result_is_error,
+        )
 
     def feed(self, chunk: str) -> list[CliStreamEvent]:
         if not chunk:
@@ -180,6 +198,20 @@ class ClaudeStreamJsonParser:
             message = event.get("message") or {}
             if isinstance(message, dict):
                 return self._handle_assistant_aggregate(message)
+            return []
+        if event_type == "system":
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                self._session_id = session_id.strip()
+            return []
+        if event_type == "result":
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                self._session_id = session_id.strip()
+            result_text = event.get("result")
+            if isinstance(result_text, str):
+                self._result_text = result_text
+            self._result_is_error = bool(event.get("is_error"))
             return []
         return []
 
@@ -300,6 +332,17 @@ class ClaudeStreamJsonParser:
                 "arguments": arguments_str,
             },
         }
+
+
+def parse_claude_stream_metadata(text: str) -> ClaudeResultMetadata:
+    if not isinstance(text, str) or not text.strip():
+        return ClaudeResultMetadata()
+    parser = ClaudeStreamJsonParser()
+    parser.feed(text if text.endswith("\n") else text + "\n")
+    parser.finalize()
+    if not parser.saw_any_json():
+        return ClaudeResultMetadata()
+    return parser.result_metadata()
 
 
 def parse_claude_stream_json(text: str) -> ParsedShimOutput:

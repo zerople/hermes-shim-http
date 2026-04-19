@@ -25,12 +25,12 @@ def _client():
 
 def _client_with_config(**overrides):
     overrides.setdefault("http_heartbeat_interval", 0)
+    overrides.setdefault("models", ["claude-cli"])
     config = ShimConfig(
         command="claude",
         args=["-p"],
         cwd="/tmp",
         timeout=30.0,
-        models=["claude-cli"],
         **overrides,
     )
     return TestClient(create_app(config))
@@ -105,12 +105,24 @@ def test_info_endpoint_reports_capabilities_and_context_window_for_claude():
     assert payload["model_id"] == "sonnet"
     assert payload["max_input_length"] == 200_000
     assert payload["max_total_tokens"] == 200_000
+    assert payload["max_concurrent_requests"] is None
     assert payload["capabilities"]["streaming"] is True
     assert payload["capabilities"]["tools"] is True
     assert payload["capabilities"]["prompt_caching"] is True
     assert payload["capabilities"]["session_resume"] is True
     assert payload["api_modes"] == ["chat_completions", "responses"]
     assert payload["models"][0]["context_length"] == 200_000
+
+
+def test_info_endpoint_reports_1m_context_for_opus():
+    client = _client_with_config(models=["opus"])
+
+    payload = client.get("/v1/info").json()
+
+    assert payload["model_id"] == "opus"
+    assert payload["max_input_length"] == 1_000_000
+    assert payload["max_total_tokens"] == 1_000_000
+    assert payload["models"][0]["context_length"] == 1_000_000
 
 
 def test_models_endpoint_includes_context_length_metadata():
@@ -122,6 +134,16 @@ def test_models_endpoint_includes_context_length_metadata():
         assert entry["context_length"] == 200_000
         assert entry["max_model_len"] == 200_000
         assert entry["max_completion_tokens"] == 64_000
+
+
+def test_models_endpoint_reports_1m_context_for_opus():
+    client = _client_with_config(models=["opus"])
+
+    entry = client.get("/v1/models").json()["data"][0]
+
+    assert entry["id"] == "opus"
+    assert entry["context_length"] == 1_000_000
+    assert entry["max_model_len"] == 1_000_000
 
 
 def test_chat_completions_returns_plain_text():

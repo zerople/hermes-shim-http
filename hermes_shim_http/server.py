@@ -26,7 +26,7 @@ from .session_cache import SessionCache, SessionPlan
 from .silence import detect_and_strip as _detect_silent, silent_sentinel
 from .slash_commands import dispatch_slash_command
 from .telemetry import emit_event
-from .token_usage import DEFAULT_CONTEXT_LIMIT, TokenUsageEstimate, estimate_token_usage
+from .token_usage import TokenUsageEstimate, context_limit_for_model, estimate_token_usage
 
 SILENT_HEADER = "X-Shim-Silent"
 
@@ -429,6 +429,14 @@ def _record_metrics(app: FastAPI, *, latency_ms: int, cache_hit: bool, usage: To
     metrics["compactions"] += 1 if compacted else 0
 
 
+def _estimate_usage_for_stream(model: str, *, config: ShimConfig, messages: list[dict[str, Any]], response_text: str) -> TokenUsageEstimate:
+    return estimate_token_usage(
+        messages=messages,
+        response_text=response_text,
+        context_limit=context_limit_for_model(model, profile=config.cli_profile if config.cli_profile != "auto" else None),
+    )
+
+
 def _debug_stats_payload(app: FastAPI) -> dict[str, Any]:
     cache_stats = app.state.session_cache.stats()
     metrics = app.state.metrics
@@ -496,14 +504,14 @@ def _remember_pending_compaction(app: FastAPI, *, model: str, base_messages: lis
     return token
 
 
-def _apply_slash_compaction(*, messages: list[dict[str, Any]], config: ShimConfig) -> tuple[list[dict[str, Any]], bool]:
+def _apply_slash_compaction(*, messages: list[dict[str, Any]], config: ShimConfig, model: str) -> tuple[list[dict[str, Any]], bool]:
     base_messages = _messages_without_last_user_command(messages)
     effective_mode = config.compaction if config.compaction != "off" else "summarize"
     return compact_messages(
         messages=base_messages,
         mode=effective_mode,
         threshold=config.compaction_threshold,
-        context_limit=DEFAULT_CONTEXT_LIMIT,
+        context_limit=context_limit_for_model(model, profile=config.cli_profile if config.cli_profile != "auto" else None),
         force=True,
     )
 
@@ -526,12 +534,12 @@ def _consume_pending_compaction(app: FastAPI, *, token: str | None, messages: li
     return [*compacted_messages, *messages[prefix_len:]], True
 
 
-def _maybe_apply_compaction(*, messages: list[dict[str, Any]], config: ShimConfig, force: bool = False) -> tuple[list[dict[str, Any]], bool]:
+def _maybe_apply_compaction(*, messages: list[dict[str, Any]], config: ShimConfig, model: str, force: bool = False) -> tuple[list[dict[str, Any]], bool]:
     return compact_messages(
         messages=messages,
         mode=config.compaction,
         threshold=config.compaction_threshold,
-        context_limit=DEFAULT_CONTEXT_LIMIT,
+        context_limit=context_limit_for_model(model, profile=config.cli_profile if config.cli_profile != "auto" else None),
         force=force,
     )
 
@@ -660,7 +668,7 @@ def _responses_prompt_from_body(body: dict[str, Any], *, config: ShimConfig, for
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         messages = [{"role": "system", "content": instructions.strip()}, *messages]
-    compacted_messages, compacted = _maybe_apply_compaction(messages=messages, config=config, force=force_compact)
+    compacted_messages, compacted = _maybe_apply_compaction(messages=messages, config=config, model=str(body.get("model") or "cli-http-shim"), force=force_compact)
     prompt = build_cli_prompt(messages=compacted_messages, model=str(body.get("model") or "cli-http-shim"), tools=normalized_tools, tool_choice=body.get("tool_choice"))
     allowed_tool_names = _allowed_tool_names_from_tools(body.get("tools"), reject_if_missing=True, strict=tools_present)
     return prompt, allowed_tool_names or set(), normalized_tools, compacted_messages, compacted
@@ -729,7 +737,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
         parsed = ParsedShimOutput(content="" if silent else cleaned_text, tool_calls=completed_tool_calls, silent=silent)
         session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
         recorded = True
-        usage = estimate_token_usage(messages=request_messages, response_text=parsed.content)
+        usage = _estimate_usage_for_stream(model, config=config, messages=request_messages, response_text=parsed.content)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
         final_choice: dict[str, Any] = {"index": 0, "delta": {}, "finish_reason": "tool_calls" if saw_tool_calls else "stop"}
         if silent:
@@ -859,7 +867,7 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         )
         # Re-derive silent after possibly flushing — response_text is the canonical source.
         _, silent = _detect_silent(response_text.strip() or accumulated_text_for_silence.strip(), has_tool_calls=has_tool_calls)
-        usage = estimate_token_usage(messages=request_messages, response_text="" if silent else cleaned_text)
+        usage = _estimate_usage_for_stream(model, config=config, messages=request_messages, response_text="" if silent else cleaned_text)
         _record_metrics(app, latency_ms=int((time.time() - started) * 1000), cache_hit=False, usage=usage, compacted=compacted)
         completed_output_items = [item for item in output_items if item.get("type") != "message"] if silent else output_items
         completed_response: dict[str, Any] = {"id": response_id, "object": "response", "created_at": created_at, "status": "completed", "model": model, "output": completed_output_items, "usage": {"input_tokens": usage.context_tokens_used, "output_tokens": usage.response_tokens, "total_tokens": usage.context_tokens_used + usage.response_tokens, "context_tokens_used": usage.context_tokens_used, "context_tokens_limit": usage.context_tokens_limit, "response_tokens": usage.response_tokens}}
@@ -906,14 +914,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
 
     def _context_window_for(model: str) -> int:
         profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
-        name = (model or "").lower()
-        if profile == "claude" or "claude" in name or name in {"opus", "sonnet", "haiku"}:
-            return 200_000
-        if profile == "codex" or "gpt-" in name or "codex" in name:
-            return 400_000
-        if profile == "opencode":
-            return 200_000
-        return 128_000
+        return context_limit_for_model(model, profile=profile)
 
     def _max_output_tokens_for(model: str) -> int:
         profile = cfg.cli_profile if cfg.cli_profile != "auto" else _infer_cli_profile(cfg.command)
@@ -922,6 +923,13 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         if profile == "codex":
             return 32_000
         return 16_000
+
+    def _estimate_usage_for(model: str, *, messages: list[dict[str, Any]], response_text: str) -> TokenUsageEstimate:
+        return estimate_token_usage(
+            messages=messages,
+            response_text=response_text,
+            context_limit=_context_window_for(model),
+        )
 
     def _model_payload(model: str) -> dict[str, Any]:
         ctx = _context_window_for(model)
@@ -958,7 +966,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             "models": [_model_payload(m) for m in cfg.models],
             "max_input_length": ctx,
             "max_total_tokens": ctx,
-            "max_concurrent_requests": 1,
+            "max_concurrent_requests": None,
             "capabilities": {
                 "streaming": True,
                 "tools": True,
@@ -1040,19 +1048,19 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             response_text = str(slash.message["content"])
             if slash.command == "clear":
                 app.state.session_cache.clear()
-                usage = estimate_token_usage(messages=request_messages, response_text=response_text)
+                usage = _estimate_usage_for(slash.model_override or request.model, messages=request_messages, response_text=response_text)
                 payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
             if slash.command == "compact":
-                compacted_messages, _compacted = _apply_slash_compaction(messages=request_messages, config=cfg)
+                compacted_messages, _compacted = _apply_slash_compaction(messages=request_messages, config=cfg, model=request.model)
                 compacted = True
                 compaction_token = _remember_pending_compaction(app, model=request.model, base_messages=_messages_without_last_user_command(request_messages), compacted_messages=compacted_messages)
-                usage = estimate_token_usage(messages=compacted_messages or request_messages, response_text=response_text)
+                usage = _estimate_usage_for(request.model, messages=compacted_messages or request_messages, response_text=response_text)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
                 payload = _chat_response(model=request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 headers = {"X-Request-Id": request_id, "X-Compaction-Token": compaction_token, **({"X-Context-Compacted": "true"} if compacted else {})}
                 return JSONResponse(content=payload, headers=headers)
-            usage = estimate_token_usage(messages=request_messages, response_text=response_text)
+            usage = _estimate_usage_for(slash.model_override or request.model, messages=request_messages, response_text=response_text)
             payload = _chat_response(model=slash.model_override or request.model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
 
@@ -1062,7 +1070,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
 
         compaction_token = http_request.headers.get("X-Compaction-Token")
         effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=request_messages, model=request.model)
-        compacted_messages, compacted = _maybe_apply_compaction(messages=effective_messages, config=cfg, force=False)
+        compacted_messages, compacted = _maybe_apply_compaction(messages=effective_messages, config=cfg, model=request.model, force=False)
         compacted = compacted or pending_compacted
         request_tools = [tool.model_dump() for tool in request.tools] if request.tools else None
         session_cache: SessionCache = app.state.session_cache
@@ -1105,8 +1113,12 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 model=request.model,
             )
             parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
-            session_cache.record_success(session_plan, assistant_messages=_assistant_messages_from_parsed(parsed))
-            usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
+            session_cache.record_success(
+                session_plan,
+                assistant_messages=_assistant_messages_from_parsed(parsed),
+                actual_session_id=result.session_id,
+            )
+            usage = _estimate_usage_for(request.model, messages=compacted_messages, response_text=parsed.content)
             _record_metrics(app, latency_ms=max(result.duration_ms, int((time.time() - started) * 1000)), cache_hit=session_plan.resume_session_id is not None, usage=usage, compacted=compacted)
             if parsed.silent:
                 emit_log(logger, event="silent", request_id=request_id, model=request.model)
@@ -1149,19 +1161,19 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             response_text = str(slash.message["content"])
             if slash.command == "clear":
                 app.state.session_cache.clear()
-                usage = estimate_token_usage(messages=raw_messages, response_text=response_text)
+                usage = _estimate_usage_for(slash.model_override or model, messages=raw_messages, response_text=response_text)
                 payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
             if slash.command == "compact":
-                compacted_messages, _compacted = _apply_slash_compaction(messages=raw_messages, config=cfg)
+                compacted_messages, _compacted = _apply_slash_compaction(messages=raw_messages, config=cfg, model=model)
                 compacted = True
                 compaction_token = _remember_pending_compaction(app, model=model, base_messages=_messages_without_last_user_command(raw_messages), compacted_messages=compacted_messages)
-                usage = estimate_token_usage(messages=compacted_messages or raw_messages, response_text=response_text)
+                usage = _estimate_usage_for(model, messages=compacted_messages or raw_messages, response_text=response_text)
                 _record_metrics(app, latency_ms=0, cache_hit=False, usage=usage, compacted=compacted)
                 payload = _responses_json_response(model=model, parsed=ParsedShimOutput(content=response_text), usage=usage)
                 headers = {"X-Request-Id": request_id, "X-Compaction-Token": compaction_token, **({"X-Context-Compacted": "true"} if compacted else {})}
                 return JSONResponse(content=payload, headers=headers)
-            usage = estimate_token_usage(messages=raw_messages, response_text=response_text)
+            usage = _estimate_usage_for(slash.model_override or model, messages=raw_messages, response_text=response_text)
             payload = _responses_json_response(model=slash.model_override or model, parsed=ParsedShimOutput(content=response_text), usage=usage)
             return JSONResponse(content=payload, headers={"X-Request-Id": request_id})
 
@@ -1194,7 +1206,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             result = run_cli_prompt(prompt, cfg, model=model)
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
-            usage = estimate_token_usage(messages=compacted_messages, response_text=parsed.content)
+            usage = _estimate_usage_for(model, messages=compacted_messages, response_text=parsed.content)
             _record_metrics(app, latency_ms=max(result.duration_ms, int((time.time() - started) * 1000)), cache_hit=False, usage=usage, compacted=compacted)
             if parsed.silent:
                 emit_log(logger, event="silent", request_id=request_id, model=model)
@@ -1247,9 +1259,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heartbeat-interval", dest="heartbeat_interval", type=float, default=60.0,
                         help="Seconds between child-CLI heartbeat emissions when --heartbeat-wrap is on (default: 60.0).")
     parser.add_argument("--single-child-lock", dest="single_child_lock", action=argparse.BooleanOptionalAction, default=True,
-        help="Enforce single-instance child-spawn lock (default: enabled) to prevent phantom-session races.")
+        help="Enforce resumed-parent child-spawn locks (default: enabled) so retries cannot fork the same upstream session concurrently.")
     parser.add_argument("--single-child-lock-path", dest="single_child_lock_path", default=None,
-        help="Path to the single-child lock file (default: /tmp/hermes-shim-http-<port>.child.lock).")
+        help="Base path for resumed-session lock files (default: /tmp/hermes-shim-http-<port>.child.lock).")
     parser.add_argument("--http-heartbeat-interval", dest="http_heartbeat_interval", type=float, default=30.0,
                         help="Seconds between whitespace heartbeat bytes on non-streaming HTTP responses. 0 disables (default: 30.0).")
     parser.add_argument("args", nargs=argparse.REMAINDER)

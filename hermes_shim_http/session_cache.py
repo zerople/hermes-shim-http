@@ -199,7 +199,13 @@ class SessionCache:
         with self._lock:
             self._in_flight_parents.discard(plan.resume_session_id)
 
-    def record_success(self, plan: SessionPlan, *, assistant_messages: list[dict[str, Any]] | None = None) -> None:
+    def record_success(
+        self,
+        plan: SessionPlan,
+        *,
+        assistant_messages: list[dict[str, Any]] | None = None,
+        actual_session_id: str | None = None,
+    ) -> None:
         now = time.time()
         conversation_messages = [*plan.messages]
         if assistant_messages:
@@ -228,7 +234,7 @@ class SessionCache:
                     """,
                     (
                         key,
-                        plan.session_id,
+                        actual_session_id or plan.session_id,
                         plan.model,
                         self._signature_prefix(model=plan.model, tools=plan.tools, tool_choice=plan.tool_choice),
                         json.dumps(conversation_messages, ensure_ascii=False, sort_keys=True),
@@ -243,7 +249,7 @@ class SessionCache:
                 cache_entry_count = int(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] or 0)
         emit_event(
             "session_recorded",
-            session_id=plan.session_id,
+            session_id=actual_session_id or plan.session_id,
             resume_session_id=plan.resume_session_id,
             model=plan.model,
             request_message_count=len(plan.messages),
