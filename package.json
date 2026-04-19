@@ -1,6 +1,6 @@
 {
   "name": "@zerople/hermes-shim-http",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Run Claude, Codex, or OpenCode as a local OpenAI-compatible HTTP provider for Hermes and other clients.",
   "license": "MIT",
   "type": "commonjs",

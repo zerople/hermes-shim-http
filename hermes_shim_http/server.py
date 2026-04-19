@@ -20,7 +20,7 @@ from .inflight import InFlightRegistry
 from .single_child import ChildLockBusy
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser
-from .prompting import build_cli_prompt, compact_messages
+from .prompting import build_cli_system_prompt, build_cli_user_prompt, compact_messages
 from .runner import parse_cli_result, resolved_cli_args, run_cli_prompt, stream_cli_prompt, supports_cli_resume
 from .session_cache import SessionCache, SessionPlan
 from .silence import detect_and_strip as _detect_silent, silent_sentinel
@@ -741,17 +741,19 @@ def _normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
     return messages
 
 
-def _responses_prompt_from_body(body: dict[str, Any], *, config: ShimConfig, force_compact: bool = False) -> tuple[str, set[str], list[dict[str, Any]] | None, list[dict[str, Any]], bool]:
+def _responses_prompt_from_body(body: dict[str, Any], *, config: ShimConfig, force_compact: bool = False) -> tuple[str, str, set[str], list[dict[str, Any]] | None, list[dict[str, Any]], bool]:
     tools_present = "tools" in body
     normalized_tools = _normalize_chat_tools(body.get("tools"), strict=tools_present)
     messages = _normalize_responses_input(body.get("input"))
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         messages = [{"role": "system", "content": instructions.strip()}, *messages]
-    compacted_messages, compacted = _maybe_apply_compaction(messages=messages, config=config, model=str(body.get("model") or "cli-http-shim"), force=force_compact)
-    prompt = build_cli_prompt(messages=compacted_messages, model=str(body.get("model") or "cli-http-shim"), tools=normalized_tools, tool_choice=body.get("tool_choice"))
+    model = str(body.get("model") or "cli-http-shim")
+    compacted_messages, compacted = _maybe_apply_compaction(messages=messages, config=config, model=model, force=force_compact)
+    system_prompt = build_cli_system_prompt(tools=normalized_tools, tool_choice=body.get("tool_choice"), model=model)
+    user_prompt = build_cli_user_prompt(messages=compacted_messages)
     allowed_tool_names = _allowed_tool_names_from_tools(body.get("tools"), reject_if_missing=True, strict=tools_present)
-    return prompt, allowed_tool_names or set(), normalized_tools, compacted_messages, compacted
+    return system_prompt, user_prompt, allowed_tool_names or set(), normalized_tools, compacted_messages, compacted
 
 
 def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, request_messages: list[dict[str, Any]], prompt: str, config: ShimConfig, allowed_tool_names: set[str] | None, session_plan: SessionPlan, session_cache: SessionCache, compacted: bool) -> Iterator[bytes]:
@@ -776,6 +778,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
         resume_session_id=session_plan.resume_session_id,
         system_prompt=session_plan.system_prompt_text,
         model=model,
+        disable_builtin_tools=bool(allowed_tool_names),
     )
     recorded = False
     try:
@@ -850,7 +853,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
             emit_log(logger, event="stream_aborted", request_id=request_id, model=model)
 
 
-def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, compacted: bool) -> Iterator[bytes]:
+def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, system_prompt: str | None, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, compacted: bool) -> Iterator[bytes]:
     response_id = f"resp_{uuid.uuid4().hex[:28]}"
     created_at = int(time.time())
     pending_text = ""
@@ -889,7 +892,7 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         pending_text_output_index = output_index
         yield _sse_line({"type": "response.output_item.added", "output_index": pending_text_output_index, "item": {"type": "message", "id": pending_text_item_id, "role": "assistant", "status": "in_progress", "content": []}})
 
-    source = stream_cli_prompt(prompt, config, model=model)
+    source = stream_cli_prompt(prompt, config, model=model, system_prompt=system_prompt, disable_builtin_tools=bool(allowed_tool_names))
     try:
         for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
@@ -1171,8 +1174,8 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             session_plan = SessionPlan(
                 session_id=str(uuid.uuid4()),
                 resume_session_id=None,
-                prompt_text=build_cli_prompt(messages=compacted_messages, model=request.model, tools=request_tools, tool_choice=request.tool_choice),
-                system_prompt_text=None,
+                prompt_text=build_cli_user_prompt(messages=compacted_messages),
+                system_prompt_text=build_cli_system_prompt(tools=request_tools, tool_choice=request.tool_choice, model=request.model),
                 prefix_message_count=0,
                 messages=compacted_messages,
                 model=request.model,
@@ -1202,6 +1205,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 resume_session_id=session_plan.resume_session_id,
                 system_prompt=session_plan.system_prompt_text,
                 model=request.model,
+                disable_builtin_tools=bool(allowed_tool_names),
             )
             parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
             session_cache.record_success(
@@ -1276,7 +1280,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         effective_messages, pending_compacted = _consume_pending_compaction(app, token=compaction_token, messages=raw_messages, model=model)
         body_for_prompt = {**body, "input": effective_messages}
         try:
-            prompt, allowed_tool_names, normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body_for_prompt, config=cfg, force_compact=False)
+            system_prompt, prompt, allowed_tool_names, normalized_tools, compacted_messages, compacted = _responses_prompt_from_body(body_for_prompt, config=cfg, force_compact=False)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": {"message": exc.detail, "type": "invalid_request_error"}})
         compacted = compacted or pending_compacted
@@ -1284,7 +1288,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if body.get("stream"):
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=True)
-            inner_stream = _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, compacted=compacted)
+            inner_stream = _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, system_prompt=system_prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, compacted=compacted)
             return StreamingResponse(
                 _release_on_exit(inner_stream, app.state.in_flight, idempotency_key),
                 media_type="text/event-stream",
@@ -1294,7 +1298,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
 
         def _run_responses() -> dict[str, Any]:
-            result = run_cli_prompt(prompt, cfg, model=model)
+            result = run_cli_prompt(prompt, cfg, model=model, system_prompt=system_prompt, disable_builtin_tools=bool(allowed_tool_names))
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
             usage = _estimate_usage_for(model, messages=compacted_messages, response_text=parsed.content)

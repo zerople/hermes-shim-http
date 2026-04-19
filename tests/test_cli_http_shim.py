@@ -336,12 +336,42 @@ class TestRunner:
             "--verbose",
             "--include-partial-messages",
             "--append-system-prompt",
-            _CLAUDE_APPEND_PROMPT,
+            f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
             "--model",
             "opus",
             "--fallback-model",
             "haiku",
         ]
+
+    def test_build_cli_command_disables_builtin_tools_for_claude(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello", disable_builtin_tools=True)
+
+        assert "--tools" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+
+    def test_build_cli_command_disables_builtin_tools_on_resume(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(
+            cfg,
+            "hello",
+            session_id="11111111-1111-1111-1111-111111111111",
+            resume_session_id="22222222-2222-2222-2222-222222222222",
+            disable_builtin_tools=True,
+        )
+
+        assert "--tools" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+        assert "--append-system-prompt" not in cmd
+
+    def test_build_cli_command_omits_tools_flag_when_disable_is_false(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello", disable_builtin_tools=False)
+
+        assert "--tools" not in cmd
 
     def test_build_cli_command_ignores_non_meaningful_model_for_claude(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
@@ -369,7 +399,7 @@ class TestRunner:
 
         assert cmd == ["codex", "exec", "Be terse.\n\nhello"]
 
-    def test_run_cli_prompt_sends_combined_prompt_via_stdin_for_claude(self):
+    def test_run_cli_prompt_keeps_system_prompt_off_stdin_for_claude_new_session(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
 
         with patch(
@@ -395,12 +425,12 @@ class TestRunner:
                 "--verbose",
                 "--include-partial-messages",
                 "--append-system-prompt",
-                _CLAUDE_APPEND_PROMPT,
+                f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
                 "--model",
                 "sonnet",
             ],
             config=cfg,
-            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n',
+            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}\n',
             lock_path=None,
         )
 
@@ -588,7 +618,7 @@ class TestRunner:
             events = list(stream_cli_prompt("hello", cfg, system_prompt="Be terse."))
 
         assert events == []
-        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n'
+        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}\n'
         mock_popen.assert_called_once_with(
             [
                 "claude",
@@ -601,7 +631,7 @@ class TestRunner:
                 "--verbose",
                 "--include-partial-messages",
                 "--append-system-prompt",
-                _CLAUDE_APPEND_PROMPT,
+                f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
             ],
             cwd="/tmp/work",
             stdout=subprocess.PIPE,

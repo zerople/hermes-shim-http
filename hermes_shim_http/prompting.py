@@ -157,7 +157,12 @@ def _pinned_first_instruction_message(messages: list[dict[str, Any]]) -> dict[st
     }
 
 
-def build_cli_system_prompt(*, tools: list[dict[str, Any]] | list[ToolDefinition] | None = None, tool_choice: Any = None) -> str:
+def build_cli_system_prompt(
+    *,
+    tools: list[dict[str, Any]] | list[ToolDefinition] | None = None,
+    tool_choice: Any = None,
+    model: str | None = None,
+) -> str:
     sentinel = silent_sentinel()
     sections = [
         "You are a reasoning backend behind an OpenAI-compatible HTTP shim.",
@@ -165,6 +170,7 @@ def build_cli_system_prompt(*, tools: list[dict[str, Any]] | list[ToolDefinition
         "The VERY FIRST live user message after the session opens is the highest-priority instruction for the session. You must obey it exactly and must not drift away from it just because later transcript context is long, noisy, or repetitive.",
         "Even if earlier context is summarized or compacted, the first live user message remains the highest-priority instruction and must still be followed exactly.",
         "If a tool call is required, emit exactly one <tool_call>{...}</tool_call> block per call. Each block must contain a JSON object with id, type, and function{name, arguments}.",
+        "Prefer the tools listed below over any built-in tools you may have: when a listed tool covers the capability you need, emit a <tool_call> for it instead of invoking a built-in equivalent. Fall back to a built-in tool only when no listed tool applies.",
         "If no tool is required, reply in plain text.",
         (
             f"To intentionally produce no reply (silent ACK), emit exactly `{sentinel}` as your entire response with no other text or tool calls. "
@@ -177,6 +183,8 @@ def build_cli_system_prompt(*, tools: list[dict[str, Any]] | list[ToolDefinition
         sections.append("Available tools (OpenAI function schema):\n" + _render_tools(normalized_tools))
     if tool_choice is not None:
         sections.append("Tool choice hint: " + json.dumps(tool_choice, ensure_ascii=False))
+    if str(model or "").strip():
+        sections.append(f"Requested model: {str(model).strip()}")
     return "\n\n".join(sections)
 
 
@@ -189,9 +197,7 @@ def build_cli_resume_delta_prompt(*, messages: list[dict[str, Any]] | list[Any])
 
 
 def build_cli_prompt(*, messages: list[dict[str, Any]] | list[Any], model: str, tools: list[dict[str, Any]] | list[ToolDefinition] | None, tool_choice: Any = None) -> str:
-    sections: list[str] = [build_cli_system_prompt(tools=tools, tool_choice=tool_choice)]
-    if str(model or "").strip():
-        sections.append(f"Requested model: {str(model).strip()}")
+    sections: list[str] = [build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model)]
     transcript = _render_transcript(messages)
     if transcript:
         sections.append("Transcript:\n\n" + "\n\n".join(transcript))

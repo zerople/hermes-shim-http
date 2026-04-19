@@ -246,8 +246,7 @@ def _stdin_prompt_text(
     resume_session_id: str | None = None,
 ) -> str:
     if _resolved_profile(config) == "claude":
-        payload_text = prompt_text if resume_session_id else _combine_prompt_text(prompt_text, system_prompt=system_prompt)
-        return _build_claude_stdin_payload(payload_text)
+        return _build_claude_stdin_payload(prompt_text)
     return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
 
 
@@ -259,6 +258,7 @@ def build_cli_command(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
+    disable_builtin_tools: bool = False,
 ) -> List[str]:
     base = [config.command, *_resolved_args(config)]
     combined = _combine_prompt_text(prompt_text, system_prompt=system_prompt)
@@ -268,7 +268,13 @@ def build_cli_command(
         if not _uses_native_claude_cli(config):
             return command
         if not resume_session_id:
-            command.extend(["--append-system-prompt", _CLAUDE_APPEND_SYSTEM_PROMPT])
+            append_text = _CLAUDE_APPEND_SYSTEM_PROMPT
+            extra = (system_prompt or "").strip()
+            if extra:
+                append_text = f"{append_text}\n\n{extra}"
+            command.extend(["--append-system-prompt", append_text])
+        if disable_builtin_tools:
+            command.extend(["--tools", ""])
         if _is_meaningful_model(model):
             command.extend(["--model", str(model).strip()])
         if config.fallback_model:
@@ -329,6 +335,7 @@ def run_cli_prompt(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
+    disable_builtin_tools: bool = False,
 ) -> CliRunResult:
     stdin_prompt = _stdin_prompt_text(
         config,
@@ -343,6 +350,7 @@ def run_cli_prompt(
         resume_session_id=resume_session_id,
         system_prompt=system_prompt,
         model=model,
+        disable_builtin_tools=disable_builtin_tools,
     )
     stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
     _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
@@ -576,6 +584,7 @@ def stream_cli_prompt(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
+    disable_builtin_tools: bool = False,
 ) -> Iterator[CliStreamEvent]:
     lock_path = _child_lock_path_for_request(
         config,
@@ -590,6 +599,7 @@ def stream_cli_prompt(
             resume_session_id=resume_session_id,
             system_prompt=system_prompt,
             model=model,
+            disable_builtin_tools=disable_builtin_tools,
         )
 
 
@@ -601,6 +611,7 @@ def _stream_cli_prompt_inner(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
+    disable_builtin_tools: bool = False,
 ) -> Iterator[CliStreamEvent]:
     stdin_prompt = _stdin_prompt_text(
         config,
@@ -615,6 +626,7 @@ def _stream_cli_prompt_inner(
         resume_session_id=resume_session_id,
         system_prompt=system_prompt,
         model=model,
+        disable_builtin_tools=disable_builtin_tools,
     )
     stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
     _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)

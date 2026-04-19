@@ -95,7 +95,7 @@ class SessionCache:
         now = time.time()
         session_id = str(uuid.uuid4())
         signature = self._signature_prefix(model=model, tools=tools, tool_choice=tool_choice)
-        system_prompt_text = build_cli_system_prompt(tools=tools, tool_choice=tool_choice)
+        system_prompt_text = build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model)
 
         with self._lock:
             self._prune_locked(now)
