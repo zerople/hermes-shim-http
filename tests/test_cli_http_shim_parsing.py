@@ -162,6 +162,39 @@ def test_claude_stream_parser_can_synthesize_progress_text_for_thinking():
     assert tool_events[0].tool_call["function"]["name"] == "read_file"
 
 
+def test_claude_stream_parser_dedups_thinking_within_a_turn():
+    parser = ClaudeStreamJsonParser(synthesize_progress=True)
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 2, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 2}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    assert texts == ["Thinking...\n"]
+
+
+def test_claude_stream_parser_emits_thinking_once_per_message_turn():
+    parser = ClaudeStreamJsonParser(synthesize_progress=True)
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}},
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+    texts = [e.text for e in events if e.kind == "text"]
+    assert texts == ["Thinking...\n", "Thinking...\n"]
+
+
 def test_claude_stream_parser_assembles_tool_use():
     parser = ClaudeStreamJsonParser()
     blob = _stream_json(

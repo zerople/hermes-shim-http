@@ -429,11 +429,80 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
 
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
-    assert 'Using tool: read_file' in body
+    assert 'Using tool: read_file path=README.md' in body
     assert '"tool_calls"' in body
     assert '"read_file"' in body
     assert '"finish_reason": "tool_calls"' in body
     assert "data: [DONE]" in body
+
+
+def test_tool_progress_preview_shows_primary_args_inline():
+    from hermes_shim_http.server import _tool_progress_preview
+
+    assert _tool_progress_preview("terminal", '{"command":"git status"}') == " command=git status"
+    assert _tool_progress_preview("read_file", {"path": "/etc/hosts", "offset": 1}) == " path=/etc/hosts"
+    assert _tool_progress_preview("patch", '{"path":"a.py","mode":"replace"}') == " path=a.py mode=replace"
+    assert _tool_progress_preview("search_files", '{"pattern":"TODO","path":"src"}') == " pattern=TODO path=src"
+    # Long values are truncated with an ellipsis so the progress line stays compact.
+    long_cmd = "x" * 200
+    preview = _tool_progress_preview("terminal", json.dumps({"command": long_cmd}))
+    assert preview.startswith(" command=")
+    assert preview.endswith("…")
+    assert len(preview) < 100
+    # Newlines collapse to a single space.
+    assert _tool_progress_preview("terminal", '{"command":"a\\nb"}') == " command=a b"
+    # Unknown tool with a single scalar arg surfaces it; empty payload stays silent.
+    assert _tool_progress_preview("some_future_tool", '{"query":"hi"}') == " query=hi"
+    assert _tool_progress_preview("terminal", "") == ""
+    assert _tool_progress_preview("terminal", "{not json") == ""
+    assert _tool_progress_preview("", '{"command":"x"}') == ""
+
+
+def test_chat_completions_streaming_progress_text_omits_preview_when_no_primary_field():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.stream_cli_prompt",
+        return_value=iter(
+            [
+                CliStreamEvent(
+                    kind="tool_call",
+                    tool_call={
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            # Empty args dict — preview should stay quiet so we don't print "Using tool: terminal \n".
+                            "arguments": "{}",
+                        },
+                    },
+                )
+            ]
+        ),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "description": "Run a command",
+                            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                        },
+                    }
+                ],
+                "stream": True,
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert "Using tool: terminal\\n" in body
+    assert "Using tool: terminal \\n" not in body
 
 
 def test_chat_completions_drops_native_claude_tool_without_hermes_equivalent():

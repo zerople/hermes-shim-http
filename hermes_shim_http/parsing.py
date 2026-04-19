@@ -148,6 +148,7 @@ class ClaudeStreamJsonParser:
         self._result_text = ""
         self._result_is_error = False
         self._synthesize_progress = synthesize_progress
+        self._thinking_emitted_this_turn = False
 
     def saw_any_json(self) -> bool:
         return self._saw_any_json
@@ -221,6 +222,7 @@ class ClaudeStreamJsonParser:
         inner_type = event.get("type")
         if inner_type == "message_start":
             self._blocks = {}
+            self._thinking_emitted_this_turn = False
             return []
         if inner_type == "content_block_start":
             index = event.get("index")
@@ -314,6 +316,9 @@ class ClaudeStreamJsonParser:
             return []
         block_type = str(block.get("type") or "").strip()
         if block_type == "thinking":
+            if self._thinking_emitted_this_turn:
+                return []
+            self._thinking_emitted_this_turn = True
             return [CliStreamEvent(kind="text", text="Thinking...\n")]
         return []
 

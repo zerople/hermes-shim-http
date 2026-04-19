@@ -2,6 +2,12 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.20] - 2026-04-19
+
+### Changed
+- **Streaming progress text now previews the primary tool arguments inline.** The chat-completions stream emits `Using tool: terminal command=git log -3` / `Using tool: read_file path=README.md` / `Using tool: patch path=a.py mode=replace` etc., instead of a bare `Using tool: terminal`, so chat UIs that only render streamed assistant text (e.g. Discord) can show *what* the agent is doing without having to decode the out-of-band `tool_calls` chunks. Per-tool primary fields are whitelisted (`terminal`→`command`, `read_file`/`write_file`/`patch`→`path`, `search_files`→`pattern`+`path`, `browser_*`→`url`/`ref`/`key`/`direction`/`question`, `skill_view`/`skill_manage`/`skills_list`, `memory`, `send_message`, `cronjob`, `clarify`, `session_search`, `delegate_task`, `vision_analyze`, `text_to_speech`, `process`) and values are whitespace-collapsed + truncated to 80 chars with an ellipsis so the progress line stays compact. Unknown tools with a single scalar arg still get that one value surfaced; everything else stays silent. Covered by new unit tests in `tests/test_cli_http_shim_server.py`.
+- **`Thinking...` progress text is now deduplicated within a single assistant turn.** Long extended-thinking responses from Claude's stream-json sometimes open several consecutive `thinking` content blocks before the actual reply. The shim previously emitted one `Thinking...\n` text event per block, which surfaced as 3–5 stacked `Thinking...` lines in chat UIs like Discord with no new information between them. The synthesized progress text is now emitted at most once per `message_start` turn — multiple thinking blocks collapse into a single line, and the counter resets on the next `message_start` so each new assistant turn still signals motion. Covered by new unit tests `test_claude_stream_parser_dedups_thinking_within_a_turn` and `test_claude_stream_parser_emits_thinking_once_per_message_turn` in `tests/test_cli_http_shim_parsing.py`.
+
 ## [0.1.18] - 2026-04-19
 
 ### Added

@@ -380,6 +380,78 @@ def _stream_chunk_for_tool_call(*, completion_id: str, created: int, model: str,
     }
 
 
+_TOOL_PROGRESS_PRIMARY_FIELDS: dict[str, tuple[str, ...]] = {
+    "terminal": ("command",),
+    "read_file": ("path",),
+    "write_file": ("path",),
+    "patch": ("path", "mode"),
+    "search_files": ("pattern", "path"),
+    "browser_navigate": ("url",),
+    "browser_click": ("ref",),
+    "browser_type": ("ref",),
+    "browser_press": ("key",),
+    "browser_scroll": ("direction",),
+    "browser_vision": ("question",),
+    "skill_view": ("name", "file_path"),
+    "skill_manage": ("action", "name"),
+    "skills_list": ("category",),
+    "memory": ("action", "target"),
+    "send_message": ("action", "target"),
+    "cronjob": ("action", "job_id", "name"),
+    "clarify": ("question",),
+    "session_search": ("query",),
+    "delegate_task": ("goal",),
+    "vision_analyze": ("question",),
+    "text_to_speech": ("text",),
+    "process": ("action", "session_id"),
+}
+
+
+def _shorten_progress_value(text: str, limit: int = 80) -> str:
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1] + "…"
+
+
+def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
+    """Short inline preview of primary tool args for the streaming progress text.
+
+    Returns a leading-space-prefixed string like " command=git status" so it can
+    be appended to "Using tool: {name}". Empty string when nothing useful to show.
+    """
+    if not name:
+        return ""
+    if isinstance(raw_arguments, str):
+        try:
+            args = json.loads(raw_arguments) if raw_arguments.strip() else {}
+        except Exception:
+            return ""
+    elif isinstance(raw_arguments, dict):
+        args = raw_arguments
+    else:
+        return ""
+    if not isinstance(args, dict) or not args:
+        return ""
+    fields = _TOOL_PROGRESS_PRIMARY_FIELDS.get(name)
+    if fields is None:
+        # Unknown tool: if there's a single scalar arg, surface it; otherwise stay quiet.
+        if len(args) == 1:
+            key, value = next(iter(args.items()))
+            if isinstance(value, (str, int, float, bool)):
+                return f" {key}={_shorten_progress_value(str(value))}"
+        return ""
+    parts: list[str] = []
+    for field in fields:
+        value = args.get(field)
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        parts.append(f"{field}={_shorten_progress_value(str(value))}")
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
+
+
 def _flush_pending_chat_text(*, completion_id: str, created: int, model: str, pending_text: str) -> Iterator[bytes]:
     if not pending_text:
         return
@@ -721,7 +793,8 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
                     pending_text += fallback_text
                     assistant_text_chunks.append(fallback_text)
                     continue
-                tool_progress_text = f"Using tool: {name}\n" if name else ""
+                args_preview = _tool_progress_preview(name, tool_call.get("function", {}).get("arguments"))
+                tool_progress_text = f"Using tool: {name}{args_preview}\n" if name else ""
                 if tool_progress_text:
                     pending_text += tool_progress_text
                     assistant_text_chunks.append(tool_progress_text)
