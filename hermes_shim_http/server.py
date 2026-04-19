@@ -413,7 +413,6 @@ def _shorten_progress_value(text: str, limit: int = 80) -> str:
         return collapsed
     return collapsed[: limit - 1] + "…"
 
-
 def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
     """Short inline preview of primary tool args for the streaming progress text.
 
