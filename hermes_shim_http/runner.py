@@ -39,6 +39,57 @@ _HEARTBEAT_WRAPPER = os.path.join(
     "bin",
     "heartbeat-wrap.py",
 )
+_RAW_LOG_ENV = "HERMES_SHIM_CLAUDE_RAW_LOG_DIR"
+
+
+def _open_raw_log(label: str):
+    log_dir = os.environ.get(_RAW_LOG_ENV, "").strip()
+    if not log_dir:
+        return None
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        fname = f"claude-raw-{ts}-{os.getpid()}-{label}.log"
+        path = os.path.join(log_dir, fname)
+        handle = open(path, "a", encoding="utf-8")
+        handle.write(f"# opened {time.strftime('%Y-%m-%dT%H:%M:%S%z')} label={label} pid={os.getpid()}\n")
+        handle.flush()
+        return handle
+    except OSError:
+        return None
+
+
+def _raw_log_write(handle, *, started: float, stream: str, kind: str, payload: str) -> None:
+    if handle is None:
+        return
+    try:
+        elapsed = time.time() - started
+        handle.write(f"[+{elapsed:8.3f}s] [{stream}] [{kind}] {payload!r}\n")
+        handle.flush()
+    except OSError:
+        pass
+
+
+def _raw_log_header(handle, *, spawn_command, session_id: str | None, resume_session_id: str | None) -> None:
+    if handle is None:
+        return
+    try:
+        handle.write(f"# spawn_command={list(spawn_command)!r}\n")
+        handle.write(f"# session_id={session_id!r} resume_session_id={resume_session_id!r}\n")
+        handle.flush()
+    except OSError:
+        pass
+
+
+def _raw_log_close(handle, *, started: float, exit_code) -> None:
+    if handle is None:
+        return
+    try:
+        elapsed = time.time() - started
+        handle.write(f"# closed elapsed={elapsed:.3f}s exit_code={exit_code}\n")
+        handle.close()
+    except OSError:
+        pass
 
 
 def _command_basename(command: str) -> str:
@@ -367,9 +418,12 @@ def _drain_cli_process_inner(
     if stdin_prompt is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
     spawn_command = _heartbeat_prefix(config) + command
+    raw_log = _open_raw_log("drain")
+    _raw_log_header(raw_log, spawn_command=spawn_command, session_id=None, resume_session_id=None)
     try:
         process = subprocess.Popen(spawn_command, **popen_kwargs)
     except OSError as exc:
+        _raw_log_close(raw_log, started=time.time(), exit_code=None)
         raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     if stdin_prompt is not None and process.stdin is not None:
@@ -380,6 +434,7 @@ def _drain_cli_process_inner(
             process.stdin.close()
     if process.stdout is None or process.stderr is None:
         _terminate_process(process)
+        _raw_log_close(raw_log, started=time.time(), exit_code=None)
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
     stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -398,6 +453,7 @@ def _drain_cli_process_inner(
     total_bytes = 0
     max_bytes = config.max_output_bytes
     hard_deadline = config.hard_deadline_seconds
+    exit_code: int | None = None
 
     try:
         while not stdout_done or not stderr_done:
@@ -411,8 +467,10 @@ def _drain_cli_process_inner(
                         stdout_done = True
                 else:
                     _, chunk = item
+                    _raw_log_write(raw_log, started=started_at, stream="stdout", kind="raw", payload=chunk)
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
+                        _raw_log_write(raw_log, started=started_at, stream="stdout", kind="real", payload=cleaned)
                         last_activity = time.time()
                         if max_bytes and total_bytes < max_bytes:
                             remaining = max_bytes - total_bytes
@@ -436,8 +494,10 @@ def _drain_cli_process_inner(
                         stderr_done = True
                     continue
                 _, chunk = item
+                _raw_log_write(raw_log, started=started_at, stream="stderr", kind="raw", payload=chunk)
                 cleaned = _strip_heartbeat(chunk)
                 if cleaned:
+                    _raw_log_write(raw_log, started=started_at, stream="stderr", kind="real", payload=cleaned)
                     last_activity = time.time()
                     stderr_chunks.append(cleaned)
 
@@ -471,6 +531,7 @@ def _drain_cli_process_inner(
         _terminate_process(process)
         stdout_thread.join(timeout=0.5)
         stderr_thread.join(timeout=0.5)
+        _raw_log_close(raw_log, started=started_at, exit_code=exit_code)
 
     return "".join(stdout_chunks), "".join(stderr_chunks), int(exit_code)
 
@@ -568,12 +629,15 @@ def _stream_cli_prompt_inner(
     if _pipes_prompt_via_stdin(config):
         popen_kwargs["stdin"] = subprocess.PIPE
     spawn_command = _heartbeat_prefix(config) + command
+    raw_log = _open_raw_log("stream")
+    _raw_log_header(raw_log, spawn_command=spawn_command, session_id=session_id, resume_session_id=resume_session_id)
     try:
         process = subprocess.Popen(
             spawn_command,
             **popen_kwargs,
         )
     except OSError as exc:
+        _raw_log_close(raw_log, started=started, exit_code=None)
         raise _translate_spawn_oserror(exc, command=config.command) from exc
 
     if _pipes_prompt_via_stdin(config) and process.stdin is not None:
@@ -582,6 +646,7 @@ def _stream_cli_prompt_inner(
         process.stdin.close()
     if process.stdout is None or process.stderr is None:
         _terminate_process(process)
+        _raw_log_close(raw_log, started=started, exit_code=None)
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
     stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -593,7 +658,8 @@ def _stream_cli_prompt_inner(
     total_bytes = 0
     max_bytes = config.max_output_bytes
     hard_deadline = config.hard_deadline_seconds
-    parser = ClaudeStreamJsonParser() if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
+    parser = ClaudeStreamJsonParser(synthesize_progress=True) if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
+    exit_code: int | None = None
 
     stdout_thread = threading.Thread(
         target=_pump_stream,
@@ -620,8 +686,10 @@ def _stream_cli_prompt_inner(
                         stdout_done = True
                 else:
                     _, chunk = item
+                    _raw_log_write(raw_log, started=started, stream="stdout", kind="raw", payload=chunk)
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
+                        _raw_log_write(raw_log, started=started, stream="stdout", kind="real", payload=cleaned)
                         last_activity = time.time()
                         if max_bytes:
                             chunk_bytes = len(cleaned.encode("utf-8"))
@@ -640,8 +708,10 @@ def _stream_cli_prompt_inner(
                         stderr_done = True
                     continue
                 _, chunk = item
+                _raw_log_write(raw_log, started=started, stream="stderr", kind="raw", payload=chunk)
                 cleaned = _strip_heartbeat(chunk)
                 if cleaned:
+                    _raw_log_write(raw_log, started=started, stream="stderr", kind="real", payload=cleaned)
                     last_activity = time.time()
                     stderr_chunks.append(cleaned)
 
@@ -681,3 +751,4 @@ def _stream_cli_prompt_inner(
         _terminate_process(process)
         stdout_thread.join(timeout=0.5)
         stderr_thread.join(timeout=0.5)
+        _raw_log_close(raw_log, started=started, exit_code=exit_code)

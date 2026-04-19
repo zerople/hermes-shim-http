@@ -2,6 +2,13 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.18] - 2026-04-19
+
+### Added
+- **Claude-native tool translation layer (`hermes_shim_http/tool_translation.py`).** When the wrapped Claude CLI emits its own native tool calls (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `TodoWrite`, etc.), the shim now translates them into their Hermes equivalents (`read_file`, `write_file`, `patch`, `search_files`, `terminal`, `todo`) so Hermes-provided tools take precedence and no round-trip to Anthropic's API is required. Tools without a Hermes equivalent (`WebSearch`, `WebFetch`, `NotebookEdit`, `ExitPlanMode`, etc.) are silently dropped instead of surfacing a noisy `Wrapped CLI emitted unsupported tool call(s)` warning, letting the wrapped CLI fall back to its own built-in handling transparently. Wired into all three call sites: non-stream `_sanitize_parsed_output`, streaming chat (`_stream_live_chat_chunks`), and streaming responses (`_stream_live_responses_events`). Covered by `tests/test_tool_translation.py` (9 tests) plus new server-level assertions in `tests/test_cli_http_shim_server.py`.
+- **`synthesize_progress` mode on `ClaudeStreamJsonParser`.** Live streaming now emits a lightweight `Thinking...\n` text event when Anthropic opens a `thinking` content block but does not stream its body, so upstream chat UIs keep showing motion during long extended-thinking turns instead of stalling behind the U+200B heartbeat. Disabled in `_drain_cli_process` (non-stream path) to keep collected outputs clean; enabled in `_stream_cli_prompt_inner`.
+- **`HERMES_SHIM_CLAUDE_RAW_LOG_DIR` debug capture.** Setting this env var causes the runner to tee every raw stdout/stderr chunk (pre- and post-heartbeat-strip) from the child CLI to a timestamped log file under the given directory, along with spawn command, session IDs, and exit code. No-op when the env var is unset, so production paths are unaffected. Intended for diagnosing stream-json regressions and phantom-session races without having to re-instrument the shim.
+
 ## [0.1.17] - 2026-04-18
 
 ### Changed

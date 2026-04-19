@@ -391,6 +391,7 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
         "hermes_shim_http.server.stream_cli_prompt",
         return_value=iter(
             [
+                CliStreamEvent(kind="text", text="Using tool: read_file\n"),
                 CliStreamEvent(
                     kind="tool_call",
                     tool_call={
@@ -428,10 +429,103 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
 
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
+    assert 'Using tool: read_file' in body
     assert '"tool_calls"' in body
     assert '"read_file"' in body
     assert '"finish_reason": "tool_calls"' in body
     assert "data: [DONE]" in body
+
+
+def test_chat_completions_drops_native_claude_tool_without_hermes_equivalent():
+    """Claude natives with no Hermes mapping (e.g. WebSearch) are dropped silently.
+
+    Claude Code executed them internally via --dangerously-skip-permissions, so
+    emitting "unsupported" would both surface a confusing error to the user and
+    undo the internal tool result the model already reasoned against.
+    """
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(
+            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"WebSearch","arguments":"{\\"query\\":\\"x\\"}"}}</tool_call>',
+            stderr="",
+            exit_code=0,
+            duration_ms=10,
+        ),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "Search"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "unsupported" not in (payload["choices"][0]["message"].get("content") or "")
+    assert "tool_calls" not in payload["choices"][0]["message"]
+
+
+def test_chat_completions_streaming_drops_native_claude_tool_without_equivalent():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.stream_cli_prompt",
+        return_value=iter(
+            [
+                CliStreamEvent(kind="text", text="Let me check. "),
+                CliStreamEvent(
+                    kind="tool_call",
+                    tool_call={
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "WebSearch",
+                            "arguments": '{"query":"x"}',
+                        },
+                    },
+                ),
+                CliStreamEvent(kind="text", text="Found it."),
+            ]
+        ),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "Search"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                    }
+                ],
+                "stream": True,
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    assert "unsupported" not in body
+    assert '"tool_calls"' not in body
+    assert '"finish_reason": "stop"' in body
 
 
 def test_chat_completions_streaming_downgrades_unsupported_tool_calls_to_text():

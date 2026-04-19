@@ -130,13 +130,13 @@ class ClaudeStreamJsonParser:
     Aggregate `assistant` events may also arrive as snapshots.
 
     This parser emits CliStreamEvent(kind="text") for each text_delta and one
-    CliStreamEvent(kind="tool_call") per completed tool_use block. Thinking,
-    signatures, and rate-limit events are silently consumed — but they still
-    produce stdout bytes, which keeps the shim's idle timer alive during long
-    reasoning.
+    CliStreamEvent(kind="tool_call") per completed tool_use block. In live
+    streaming mode it can also synthesize lightweight progress text from
+    thinking/tool_use block starts so upstream chat UIs keep moving even when
+    Anthropic does not stream the body of a thinking block.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, synthesize_progress: bool = False) -> None:
         self._line_buffer = ""
         self._blocks: dict[int, dict[str, Any]] = {}
         self._tool_call_count = 0
@@ -147,6 +147,7 @@ class ClaudeStreamJsonParser:
         self._session_id: str | None = None
         self._result_text = ""
         self._result_is_error = False
+        self._synthesize_progress = synthesize_progress
 
     def saw_any_json(self) -> bool:
         return self._saw_any_json
@@ -231,6 +232,7 @@ class ClaudeStreamJsonParser:
                     "name": block.get("name"),
                     "input_json": "",
                 }
+                return self._progress_events_for_block_start(block)
             return []
         if inner_type == "content_block_delta":
             index = event.get("index")
@@ -305,6 +307,14 @@ class ClaudeStreamJsonParser:
         )
         if normalized:
             return [CliStreamEvent(kind="tool_call", tool_call=normalized)]
+        return []
+
+    def _progress_events_for_block_start(self, block: dict[str, Any]) -> list[CliStreamEvent]:
+        if not self._synthesize_progress:
+            return []
+        block_type = str(block.get("type") or "").strip()
+        if block_type == "thinking":
+            return [CliStreamEvent(kind="text", text="Thinking...\n")]
         return []
 
     def _normalize_tool_use(

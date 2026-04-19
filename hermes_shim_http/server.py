@@ -27,6 +27,10 @@ from .silence import detect_and_strip as _detect_silent, silent_sentinel
 from .slash_commands import dispatch_slash_command
 from .telemetry import emit_event
 from .token_usage import TokenUsageEstimate, context_limit_for_model, estimate_token_usage
+from .tool_translation import (
+    is_claude_native_without_hermes_equivalent,
+    translate_tool_call,
+)
 
 SILENT_HEADER = "X-Shim-Silent"
 
@@ -220,10 +224,14 @@ def _sanitize_parsed_output(parsed: ParsedShimOutput, allowed_tool_names: set[st
     allowed_calls: list[dict[str, Any]] = []
     unsupported_names: list[str] = []
     for tool_call in parsed.tool_calls:
-        name = str(tool_call.get("function", {}).get("name") or "").strip()
+        translated = translate_tool_call(tool_call, allowed_names=allowed_tool_names)
+        name = str(translated.get("function", {}).get("name") or "").strip()
         if name and name in allowed_tool_names:
-            allowed_calls.append(tool_call)
-        elif name:
+            allowed_calls.append(translated)
+            continue
+        if name and is_claude_native_without_hermes_equivalent(name, allowed_names=allowed_tool_names):
+            continue
+        if name:
             unsupported_names.append(name)
 
     if not unsupported_names:
@@ -704,17 +712,24 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
                 yield b": ping\n\n"
                 continue
             if event.kind == "tool_call" and event.tool_call:
-                name = str(event.tool_call.get("function", {}).get("name") or "").strip()
+                tool_call = translate_tool_call(event.tool_call, allowed_names=allowed_tool_names)
+                name = str(tool_call.get("function", {}).get("name") or "").strip()
                 if allowed_tool_names is not None and name not in allowed_tool_names:
+                    if is_claude_native_without_hermes_equivalent(name, allowed_names=allowed_tool_names):
+                        continue
                     fallback_text = _unsupported_tool_message([name])
                     pending_text += fallback_text
                     assistant_text_chunks.append(fallback_text)
                     continue
+                tool_progress_text = f"Using tool: {name}\n" if name else ""
+                if tool_progress_text:
+                    pending_text += tool_progress_text
+                    assistant_text_chunks.append(tool_progress_text)
                 yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
                 pending_text = ""
                 saw_tool_calls = True
-                completed_tool_calls.append(event.tool_call)
-                yield _sse_line(_stream_chunk_for_tool_call(completion_id=completion_id, created=created, model=model, tool_call=event.tool_call, index=tool_index))
+                completed_tool_calls.append(tool_call)
+                yield _sse_line(_stream_chunk_for_tool_call(completion_id=completion_id, created=created, model=model, tool_call=tool_call, index=tool_index))
                 tool_index += 1
             elif event.kind == "text" and event.text:
                 pending_text += event.text
@@ -816,8 +831,11 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
                         yield from ensure_text_item_started()
                         yield _sse_line({"type": "response.output_text.delta", "delta": buffered_text, "output_index": pending_text_output_index, "content_index": 0})
                         buffered_text = ""
-                name = str(event.tool_call.get("function", {}).get("name") or "").strip()
+                tool_call = translate_tool_call(event.tool_call, allowed_names=allowed_tool_names)
+                name = str(tool_call.get("function", {}).get("name") or "").strip()
                 if allowed_tool_names is not None and name not in allowed_tool_names:
+                    if is_claude_native_without_hermes_equivalent(name, allowed_names=allowed_tool_names):
+                        continue
                     fallback_text = _unsupported_tool_message([name])
                     pending_text += fallback_text
                     accumulated_text_for_silence += fallback_text
@@ -825,7 +843,7 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
                     yield _sse_line({"type": "response.output_text.delta", "delta": fallback_text, "output_index": pending_text_output_index, "content_index": 0})
                     continue
                 yield from flush_text()
-                item = {"type": "function_call", "id": f"fc_{uuid.uuid4().hex[:24]}", "call_id": event.tool_call["id"], "name": event.tool_call["function"]["name"], "arguments": event.tool_call["function"]["arguments"]}
+                item = {"type": "function_call", "id": f"fc_{uuid.uuid4().hex[:24]}", "call_id": tool_call["id"], "name": tool_call["function"]["name"], "arguments": tool_call["function"]["arguments"]}
                 output_items.append(item)
                 yield _sse_line({"type": "response.output_item.added", "output_index": output_index, "item": item})
                 yield _sse_line({"type": "response.output_item.done", "output_index": output_index, "item": item})

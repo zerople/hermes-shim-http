@@ -144,6 +144,24 @@ def test_claude_stream_parser_ignores_thinking_delta():
     assert events == []
 
 
+def test_claude_stream_parser_can_synthesize_progress_text_for_thinking():
+    parser = ClaudeStreamJsonParser(synthesize_progress=True)
+    blob = _stream_json(
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}},
+        {"type": "stream_event", "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"path":"README.md"}'}}},
+        {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}},
+    )
+    events = parser.feed(blob) + parser.finalize()
+
+    texts = [e.text for e in events if e.kind == "text"]
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    assert texts == ["Thinking...\n"]
+    assert len(tool_events) == 1
+    assert tool_events[0].tool_call["function"]["name"] == "read_file"
+
+
 def test_claude_stream_parser_assembles_tool_use():
     parser = ClaudeStreamJsonParser()
     blob = _stream_json(
