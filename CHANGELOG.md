@@ -2,6 +2,11 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.22] - 2026-04-19
+
+### Changed
+- **Tool argument preview is now wrapped in a triple-backtick fenced code block.** The streaming progress text now emits e.g. `Using tool: patch ` followed by `` ```path=a.py mode=replace``` `` instead of the bare `Using tool: patch path=a.py mode=replace`. Chat UIs that render Markdown (notably Discord) now display the args in a monospace code block, which keeps long paths/commands visually separated from the surrounding `Using tool:` prefix and avoids accidental Markdown parsing of characters inside the args (slashes, equals, asterisks, underscores, etc.). The single-scalar fallback for unknown tools is wrapped the same way; empty-arg tools still stay silent; the trailing paragraph break (`\n\n`) introduced in 0.1.21 is preserved. Tests in `tests/test_cli_http_shim_server.py::test_tool_progress_preview_shows_primary_args_inline` and `test_chat_completions_streaming_returns_live_tool_call_chunks` updated to assert on the new fenced-code-block shape.
+
 ## [0.1.21] - 2026-04-19
 
 ### Fixed

@@ -417,8 +417,9 @@ def _shorten_progress_value(text: str, limit: int = 80) -> str:
 def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
     """Short inline preview of primary tool args for the streaming progress text.
 
-    Returns a leading-space-prefixed string like " command=git status" so it can
-    be appended to "Using tool: {name}". Empty string when nothing useful to show.
+    Returns a leading-space-prefixed, triple-backtick-wrapped string like
+    " ```command=git status```" so it can be appended to "Using tool: {name}"
+    and render as a Discord code block. Empty string when nothing useful to show.
     """
     if not name:
         return ""
@@ -439,7 +440,7 @@ def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
         if len(args) == 1:
             key, value = next(iter(args.items()))
             if isinstance(value, (str, int, float, bool)):
-                return f" {key}={_shorten_progress_value(str(value))}"
+                return f" ```{key}={_shorten_progress_value(str(value))}```"
         return ""
     parts: list[str] = []
     for field in fields:
@@ -449,7 +450,7 @@ def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
         parts.append(f"{field}={_shorten_progress_value(str(value))}")
     if not parts:
         return ""
-    return " " + " ".join(parts)
+    return " ```" + " ".join(parts) + "```"
 
 
 def _flush_pending_chat_text(*, completion_id: str, created: int, model: str, pending_text: str) -> Iterator[bytes]:
