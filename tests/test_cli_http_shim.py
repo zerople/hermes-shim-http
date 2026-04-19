@@ -880,7 +880,7 @@ class TestRunner:
 
         texts = [e.text for e in events if e.kind == "text"]
         tool_calls = [e for e in events if e.kind == "tool_call"]
-        assert "".join(texts) == "Thinking...\nStreaming hello from claude"
+        assert "".join(texts) == "Thinking...\n\nStreaming hello from claude"
         assert tool_calls == []
 
     def test_stream_cli_prompt_claude_stream_json_emits_tool_use(self):

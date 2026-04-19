@@ -794,7 +794,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
                     assistant_text_chunks.append(fallback_text)
                     continue
                 args_preview = _tool_progress_preview(name, tool_call.get("function", {}).get("arguments"))
-                tool_progress_text = f"Using tool: {name}{args_preview}\n" if name else ""
+                tool_progress_text = f"Using tool: {name}{args_preview}\n\n" if name else ""
                 if tool_progress_text:
                     pending_text += tool_progress_text
                     assistant_text_chunks.append(tool_progress_text)

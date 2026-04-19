@@ -2,6 +2,11 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.21] - 2026-04-19
+
+### Fixed
+- **Progress text now emits a paragraph break (`\n\n`) instead of a single newline.** Some streaming chat UIs (notably Discord's delta renderer) strip a lone trailing `\n` between successive assistant text deltas, which caused `Thinking...` and the following `Using tool: ...` line to render glued together on one line. Emitting `\n\n` forces a paragraph boundary that survives the delta-merging heuristics, so each progress line lands on its own row in every tested renderer. Applied to both `Thinking...` synthesis in `ClaudeStreamJsonParser._progress_events_for_block_start` and the `Using tool: <name> <args>` prefix in `_stream_live_chat_chunks`. Covered tests updated to assert on the new `\n\n` shape.
+
 ## [0.1.20] - 2026-04-19
 
 ### Changed

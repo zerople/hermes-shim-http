@@ -157,7 +157,7 @@ def test_claude_stream_parser_can_synthesize_progress_text_for_thinking():
 
     texts = [e.text for e in events if e.kind == "text"]
     tool_events = [e for e in events if e.kind == "tool_call"]
-    assert texts == ["Thinking...\n"]
+    assert texts == ["Thinking...\n\n"]
     assert len(tool_events) == 1
     assert tool_events[0].tool_call["function"]["name"] == "read_file"
 
@@ -175,7 +175,7 @@ def test_claude_stream_parser_dedups_thinking_within_a_turn():
     )
     events = parser.feed(blob) + parser.finalize()
     texts = [e.text for e in events if e.kind == "text"]
-    assert texts == ["Thinking...\n"]
+    assert texts == ["Thinking...\n\n"]
 
 
 def test_claude_stream_parser_emits_thinking_once_per_message_turn():
@@ -192,7 +192,7 @@ def test_claude_stream_parser_emits_thinking_once_per_message_turn():
     )
     events = parser.feed(blob) + parser.finalize()
     texts = [e.text for e in events if e.kind == "text"]
-    assert texts == ["Thinking...\n", "Thinking...\n"]
+    assert texts == ["Thinking...\n\n", "Thinking...\n\n"]
 
 
 def test_claude_stream_parser_assembles_tool_use():

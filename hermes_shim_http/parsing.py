@@ -319,7 +319,7 @@ class ClaudeStreamJsonParser:
             if self._thinking_emitted_this_turn:
                 return []
             self._thinking_emitted_this_turn = True
-            return [CliStreamEvent(kind="text", text="Thinking...\n")]
+            return [CliStreamEvent(kind="text", text="Thinking...\n\n")]
         return []
 
     def _normalize_tool_use(
