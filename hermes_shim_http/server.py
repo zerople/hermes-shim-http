@@ -415,6 +415,7 @@ def _shorten_progress_value(text: str, limit: int = 80) -> str:
 
 
 def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
+def _tool_progress_preview(name: str, raw_arguments: Any) -> str:
     """Short inline preview of primary tool args for the streaming progress text.
 
     Returns a leading-space-prefixed, triple-backtick-wrapped string like
