@@ -2,6 +2,20 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.16] - 2026-04-18
+
+### Fixed
+- **Phantom-session child-spawn race (P0).** `InFlightRegistry` (v0.1.14) only blocks concurrent requests that share an `Idempotency-Key` / `X-Request-Id` header. Clients that don't send one — or that send a fresh UUID per request — bypassed the guard entirely, so a slow first turn plus a transport-level retry could spawn a second `claude` / `codex` child alongside the first. Both children then wrote to the same on-disk SSOT (agent state JSON, worktree files, `.lck/` scratch) and produced phantom task IDs, ghost worktrees, and mysterious "file I didn't create" artefacts. Confirmed in the field: two sibling `heartbeat-wrap → claude --fork-session` chains holding inotify watchers on the same cwd.
+
+### Added
+- **`single_child_lock_path`: process-level single-instance child-spawn lock.** Before `_drain_cli_process` and `stream_cli_prompt` invoke `subprocess.Popen`, the shim non-blocking `fcntl.flock`s a port-scoped lock file (`/tmp/hermes-shim-http-<port>.child.lock` by default). A concurrent spawn attempt raises `ChildLockBusy` → HTTP **409 `child_lock_busy`** with `Retry-After: 5`. The lock is held for the child's entire lifetime (including the full stream-generator body via `yield from`) and released on return, exception, or client disconnect. Independent of `InFlightRegistry`: covers clients that don't send idempotency keys.
+- **CLI flags `--single-child-lock` / `--no-single-child-lock` / `--single-child-lock-path PATH`.** On by default. Explicit path overrides the port-derived default. Echoed in `/v1/info` and the startup config payload for observability.
+- New module `hermes_shim_http/single_child.py` (`acquire_single_child_lock` context manager + `ChildLockBusy` exception). Covered by `tests/test_single_child_lock.py` — 5 tests including cross-process contention via `multiprocessing.Process`.
+
+### Notes
+- `InFlightRegistry` remains the first line of defence for idempotent clients and is unchanged — the new lock is a backstop that protects on-disk SSOT even when upstream idempotency coverage lapses.
+- Recommended opt-out: only for intentional multi-tenant shim deployments where concurrent child CLIs are desired and the state on disk is safely partitioned.
+
 ## [0.1.15] - 2026-04-18
 
 ### Fixed
