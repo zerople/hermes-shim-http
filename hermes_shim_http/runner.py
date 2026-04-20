@@ -246,7 +246,8 @@ def _stdin_prompt_text(
     resume_session_id: str | None = None,
 ) -> str:
     if _resolved_profile(config) == "claude":
-        return _build_claude_stdin_payload(prompt_text)
+        payload_text = prompt_text if resume_session_id else _combine_prompt_text(prompt_text, system_prompt=system_prompt)
+        return _build_claude_stdin_payload(payload_text)
     return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
 
 
@@ -268,11 +269,7 @@ def build_cli_command(
         if not _uses_native_claude_cli(config):
             return command
         if not resume_session_id:
-            append_text = _CLAUDE_APPEND_SYSTEM_PROMPT
-            extra = (system_prompt or "").strip()
-            if extra:
-                append_text = f"{append_text}\n\n{extra}"
-            command.extend(["--append-system-prompt", append_text])
+            command.extend(["--append-system-prompt", _CLAUDE_APPEND_SYSTEM_PROMPT])
         if disable_builtin_tools:
             command.extend(["--tools", ""])
         if _is_meaningful_model(model):

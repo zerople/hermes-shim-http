@@ -2,6 +2,11 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.24] - 2026-04-19
+
+### Fixed
+- **HTTP 400 `out of extra usage` regression when Hermes runs on an OAuth Pro/Max plan.** 0.1.23 moved the Hermes tool catalog from the stdin user message into the `--append-system-prompt` flag value (merged with the short turn-discipline preface). With Hermes-scale payloads the catalog is ~22 KB, which alone pushes Anthropic's OAuth billing classifier to route the request to the extra-usage bucket instead of the plan-included bucket — even when the account has no extra-usage credit — and the CLI then fails with `400 ... out of extra usage`. Isolated end-to-end with a real captured request (V1–V5 replay matrix against the live API): big `--append-system-prompt` alone triggers the 400 regardless of stdin size or `--tools ""`. 0.1.24 reverts the catalog back into the stdin user message (0.1.22's channel), so `--append-system-prompt` once again carries only the ~281-byte turn-discipline preface and stays in the plan-included bucket. The `--tools ""` enforcement from 0.1.23 is preserved (it is independently confirmed to be billing-neutral), so Hermes tools still structurally win over Claude built-ins. `build_cli_command` no longer merges the caller-supplied `system_prompt` into the flag value; `_stdin_prompt_text` now prepends it to the Claude stream-json user-message text on new sessions (resumes keep the existing `system_prompt`-off-stdin invariant). Tests in `tests/test_cli_http_shim.py` updated accordingly.
+
 ## [0.1.23] - 2026-04-19
 
 ### Changed

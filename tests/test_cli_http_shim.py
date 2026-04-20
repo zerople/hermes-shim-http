@@ -336,7 +336,7 @@ class TestRunner:
             "--verbose",
             "--include-partial-messages",
             "--append-system-prompt",
-            f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
+            _CLAUDE_APPEND_PROMPT,
             "--model",
             "opus",
             "--fallback-model",
@@ -399,7 +399,7 @@ class TestRunner:
 
         assert cmd == ["codex", "exec", "Be terse.\n\nhello"]
 
-    def test_run_cli_prompt_keeps_system_prompt_off_stdin_for_claude_new_session(self):
+    def test_run_cli_prompt_merges_system_prompt_into_claude_stdin_for_new_session(self):
         cfg = ShimConfig(command="claude", args=["-p"], cwd="/tmp/work", timeout=12.0)
 
         with patch(
@@ -425,12 +425,12 @@ class TestRunner:
                 "--verbose",
                 "--include-partial-messages",
                 "--append-system-prompt",
-                f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
+                _CLAUDE_APPEND_PROMPT,
                 "--model",
                 "sonnet",
             ],
             config=cfg,
-            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}\n',
+            stdin_prompt='{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n',
             lock_path=None,
         )
 
@@ -618,7 +618,7 @@ class TestRunner:
             events = list(stream_cli_prompt("hello", cfg, system_prompt="Be terse."))
 
         assert events == []
-        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}\n'
+        assert fake_process.stdin.value == b'{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Be terse.\\n\\nhello"}]}}\n'
         mock_popen.assert_called_once_with(
             [
                 "claude",
@@ -631,7 +631,7 @@ class TestRunner:
                 "--verbose",
                 "--include-partial-messages",
                 "--append-system-prompt",
-                f"{_CLAUDE_APPEND_PROMPT}\n\nBe terse.",
+                _CLAUDE_APPEND_PROMPT,
             ],
             cwd="/tmp/work",
             stdout=subprocess.PIPE,
