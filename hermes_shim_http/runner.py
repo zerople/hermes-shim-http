@@ -452,10 +452,9 @@ def _drain_cli_process_inner(
         _raw_log_close(raw_log, started=time.time(), exit_code=None)
         raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
-    stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-    stderr_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-    stdout_thread = threading.Thread(target=_pump_stream, args=(process.stdout, stdout_queue, "stdout"), daemon=True)
-    stderr_thread = threading.Thread(target=_pump_stream, args=(process.stderr, stderr_queue, "stderr"), daemon=True)
+    events: "queue.Queue[tuple[str, str | None]]" = queue.Queue()
+    stdout_thread = threading.Thread(target=_pump_stream, args=(process.stdout, events, "stdout"), daemon=True)
+    stderr_thread = threading.Thread(target=_pump_stream, args=(process.stderr, events, "stderr"), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
 
@@ -472,54 +471,37 @@ def _drain_cli_process_inner(
 
     try:
         while not stdout_done or not stderr_done:
-            if not stdout_done:
-                try:
-                    item = stdout_queue.get(timeout=0.05)
-                except queue.Empty:
-                    item = None
-                if item is None:
-                    if not stdout_thread.is_alive() and stdout_queue.empty():
+            try:
+                stream_name, chunk = events.get(timeout=_DEADLINE_CHECK_INTERVAL)
+            except queue.Empty:
+                chunk = None
+                stream_name = None
+            else:
+                if chunk is None:
+                    if stream_name == "stdout":
                         stdout_done = True
+                    elif stream_name == "stderr":
+                        stderr_done = True
                 else:
-                    _, chunk = item
-                    _raw_log_write(raw_log, started=started_at, stream="stdout", kind="raw", payload=chunk)
+                    _raw_log_write(raw_log, started=started_at, stream=stream_name, kind="raw", payload=chunk)
                     cleaned = _strip_heartbeat(chunk)
                     if cleaned:
-                        _raw_log_write(raw_log, started=started_at, stream="stdout", kind="real", payload=cleaned)
+                        _raw_log_write(raw_log, started=started_at, stream=stream_name, kind="real", payload=cleaned)
                         last_activity = time.time()
-                        if max_bytes and total_bytes < max_bytes:
-                            remaining = max_bytes - total_bytes
-                            chunk_bytes = len(cleaned.encode("utf-8"))
-                            if chunk_bytes > remaining:
-                                stdout_chunks.append(cleaned.encode("utf-8")[:remaining].decode("utf-8", errors="ignore"))
-                                total_bytes = max_bytes
-                            else:
+                        if stream_name == "stdout":
+                            if max_bytes and total_bytes < max_bytes:
+                                remaining = max_bytes - total_bytes
+                                chunk_bytes = len(cleaned.encode("utf-8"))
+                                if chunk_bytes > remaining:
+                                    stdout_chunks.append(cleaned.encode("utf-8")[:remaining].decode("utf-8", errors="ignore"))
+                                    total_bytes = max_bytes
+                                else:
+                                    stdout_chunks.append(cleaned)
+                                    total_bytes += chunk_bytes
+                            elif not max_bytes:
                                 stdout_chunks.append(cleaned)
-                                total_bytes += chunk_bytes
-                        elif not max_bytes:
-                            stdout_chunks.append(cleaned)
-
-            while True:
-                try:
-                    item = stderr_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item is None:
-                    if not stderr_thread.is_alive() and stderr_queue.empty():
-                        stderr_done = True
-                    continue
-                _, chunk = item
-                _raw_log_write(raw_log, started=started_at, stream="stderr", kind="raw", payload=chunk)
-                cleaned = _strip_heartbeat(chunk)
-                if cleaned:
-                    _raw_log_write(raw_log, started=started_at, stream="stderr", kind="real", payload=cleaned)
-                    last_activity = time.time()
-                    stderr_chunks.append(cleaned)
-
-            if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
-                stderr_done = True
-            if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
-                stdout_done = True
+                        else:
+                            stderr_chunks.append(cleaned)
 
             now = time.time()
             if now - last_activity > config.timeout:
@@ -551,9 +533,15 @@ def _drain_cli_process_inner(
     return "".join(stdout_chunks), "".join(stderr_chunks), int(exit_code)
 
 
+# Consumer loops wait on a single combined queue of (stream_name, payload) items
+# where payload=None marks that stream's EOF. Using one queue lets get() wake up
+# immediately on any stdout/stderr activity and removes the prior 50ms polling.
+_DEADLINE_CHECK_INTERVAL = 1.0
+
+
 def _pump_stream(
     stream,
-    sink: queue.Queue[tuple[str, str] | None],
+    sink: "queue.Queue[tuple[str, str | None]]",
     stream_name: str,
     *,
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
@@ -580,7 +568,7 @@ def _pump_stream(
             stream.close()
         except Exception:
             pass
-        sink.put(None)
+        sink.put((stream_name, None))
 
 
 def stream_cli_prompt(
@@ -673,8 +661,7 @@ def _stream_cli_prompt_inner(
             _raw_log_close(raw_log, started=started, exit_code=None)
             raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
-        stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-        stderr_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        events: "queue.Queue[tuple[str, str | None]]" = queue.Queue()
         stdout_done = False
         stderr_done = False
         stdout_chunks: list[str] = []
@@ -687,12 +674,12 @@ def _stream_cli_prompt_inner(
 
         stdout_thread = threading.Thread(
             target=_pump_stream,
-            args=(process.stdout, stdout_queue, "stdout"),
+            args=(process.stdout, events, "stdout"),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=_pump_stream,
-            args=(process.stderr, stderr_queue, "stderr"),
+            args=(process.stderr, events, "stderr"),
             daemon=True,
         )
         stdout_thread.start()
@@ -700,50 +687,31 @@ def _stream_cli_prompt_inner(
 
         try:
             while not stdout_done or not stderr_done:
-                if not stdout_done:
-                    try:
-                        item = stdout_queue.get(timeout=0.05)
-                    except queue.Empty:
-                        item = None
-                    if item is None:
-                        if not stdout_thread.is_alive() and stdout_queue.empty():
+                try:
+                    stream_name, chunk = events.get(timeout=_DEADLINE_CHECK_INTERVAL)
+                except queue.Empty:
+                    stream_name = None
+                    chunk = None
+                else:
+                    if chunk is None:
+                        if stream_name == "stdout":
                             stdout_done = True
+                        elif stream_name == "stderr":
+                            stderr_done = True
                     else:
-                        _, chunk = item
-                        _raw_log_write(raw_log, started=started, stream="stdout", kind="raw", payload=chunk)
+                        _raw_log_write(raw_log, started=started, stream=stream_name, kind="raw", payload=chunk)
                         cleaned = _strip_heartbeat(chunk)
                         if cleaned:
-                            _raw_log_write(raw_log, started=started, stream="stdout", kind="real", payload=cleaned)
+                            _raw_log_write(raw_log, started=started, stream=stream_name, kind="real", payload=cleaned)
                             last_activity = time.time()
-                            if max_bytes:
-                                chunk_bytes = len(cleaned.encode("utf-8"))
-                                total_bytes += chunk_bytes
-                            stdout_chunks.append(cleaned)
-                            for event in parser.feed(cleaned):
-                                yield event
-
-                while True:
-                    try:
-                        item = stderr_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if item is None:
-                        if not stderr_thread.is_alive() and stderr_queue.empty():
-                            stderr_done = True
-                        continue
-                    _, chunk = item
-                    _raw_log_write(raw_log, started=started, stream="stderr", kind="raw", payload=chunk)
-                    cleaned = _strip_heartbeat(chunk)
-                    if cleaned:
-                        _raw_log_write(raw_log, started=started, stream="stderr", kind="real", payload=cleaned)
-                        last_activity = time.time()
-                        stderr_chunks.append(cleaned)
-
-                if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
-                    stderr_done = True
-
-                if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
-                    stdout_done = True
+                            if stream_name == "stdout":
+                                if max_bytes:
+                                    total_bytes += len(cleaned.encode("utf-8"))
+                                stdout_chunks.append(cleaned)
+                                for event in parser.feed(cleaned):
+                                    yield event
+                            else:
+                                stderr_chunks.append(cleaned)
 
                 now = time.time()
                 if now - last_activity > config.timeout:
