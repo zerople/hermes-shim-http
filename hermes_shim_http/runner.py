@@ -249,6 +249,7 @@ def _stdin_prompt_text(
         payload_text = prompt_text if resume_session_id else _combine_prompt_text(prompt_text, system_prompt=system_prompt)
         return _build_claude_stdin_payload(payload_text)
     return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
+    return _combine_prompt_text(prompt_text, system_prompt=system_prompt)
 
 
 def build_cli_command(
