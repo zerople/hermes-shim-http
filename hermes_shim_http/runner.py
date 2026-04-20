@@ -19,6 +19,7 @@ from .parsing import (
     parse_claude_stream_metadata,
     parse_cli_output,
 )
+from .hermes_mcp import request_scoped_mcp_config
 from .single_child import ChildLockBusy, acquire_single_child_lock
 from .telemetry import emit_event
 
@@ -260,7 +261,8 @@ def build_cli_command(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
-    disable_builtin_tools: bool = False,
+    disable_builtin_tools: bool = True,
+    mcp_config_path: str | None = None,
 ) -> List[str]:
     base = [config.command, *_resolved_args(config)]
     combined = _combine_prompt_text(prompt_text, system_prompt=system_prompt)
@@ -271,6 +273,10 @@ def build_cli_command(
             return command
         if not resume_session_id:
             command.extend(["--append-system-prompt", _CLAUDE_APPEND_SYSTEM_PROMPT])
+        if mcp_config_path:
+            command.extend(["--mcp-config", mcp_config_path])
+        if config.strict_mcp_config:
+            command.append("--strict-mcp-config")
         if disable_builtin_tools:
             command.extend(["--tools", ""])
         if _is_meaningful_model(model):
@@ -333,36 +339,39 @@ def run_cli_prompt(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
-    disable_builtin_tools: bool = False,
+    disable_builtin_tools: bool = True,
+    advertised_tools: list[dict] | None = None,
 ) -> CliRunResult:
-    stdin_prompt = _stdin_prompt_text(
-        config,
-        prompt_text,
-        system_prompt=system_prompt,
-        resume_session_id=resume_session_id,
-    )
-    command = build_cli_command(
-        config,
-        prompt_text,
-        session_id=session_id,
-        resume_session_id=resume_session_id,
-        system_prompt=system_prompt,
-        model=model,
-        disable_builtin_tools=disable_builtin_tools,
-    )
-    stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
-    _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
-    started = time.time()
-    stdout_text, stderr_text, exit_code = _drain_cli_process(
-        command,
-        config=config,
-        stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
-        lock_path=_child_lock_path_for_request(
+    with request_scoped_mcp_config(tools=advertised_tools if _resolved_profile(config) == "claude" else None) as mcp_config_path:
+        stdin_prompt = _stdin_prompt_text(
             config,
+            prompt_text,
+            system_prompt=system_prompt,
+            resume_session_id=resume_session_id,
+        )
+        command = build_cli_command(
+            config,
+            prompt_text,
             session_id=session_id,
             resume_session_id=resume_session_id,
-        ),
-    )
+            system_prompt=system_prompt,
+            model=model,
+            disable_builtin_tools=disable_builtin_tools,
+            mcp_config_path=mcp_config_path,
+        )
+        stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
+        _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
+        started = time.time()
+        stdout_text, stderr_text, exit_code = _drain_cli_process(
+            command,
+            config=config,
+            stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
+            lock_path=_child_lock_path_for_request(
+                config,
+                session_id=session_id,
+                resume_session_id=resume_session_id,
+            ),
+        )
     duration_ms = int((time.time() - started) * 1000)
     result = CliRunResult(
         stdout=stdout_text,
@@ -582,7 +591,8 @@ def stream_cli_prompt(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
-    disable_builtin_tools: bool = False,
+    disable_builtin_tools: bool = True,
+    advertised_tools: list[dict] | None = None,
 ) -> Iterator[CliStreamEvent]:
     lock_path = _child_lock_path_for_request(
         config,
@@ -598,6 +608,7 @@ def stream_cli_prompt(
             system_prompt=system_prompt,
             model=model,
             disable_builtin_tools=disable_builtin_tools,
+            advertised_tools=advertised_tools,
         )
 
 
@@ -609,156 +620,159 @@ def _stream_cli_prompt_inner(
     resume_session_id: str | None = None,
     system_prompt: str | None = None,
     model: str | None = None,
-    disable_builtin_tools: bool = False,
+    disable_builtin_tools: bool = True,
+    advertised_tools: list[dict] | None = None,
 ) -> Iterator[CliStreamEvent]:
-    stdin_prompt = _stdin_prompt_text(
-        config,
-        prompt_text,
-        system_prompt=system_prompt,
-        resume_session_id=resume_session_id,
-    )
-    command = build_cli_command(
-        config,
-        prompt_text,
-        session_id=session_id,
-        resume_session_id=resume_session_id,
-        system_prompt=system_prompt,
-        model=model,
-        disable_builtin_tools=disable_builtin_tools,
-    )
-    stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
-    _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
-    started = time.time()
-    last_activity = started
-    popen_kwargs = {
-        "cwd": config.cwd,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "bufsize": 0,
-    }
-    if _pipes_prompt_via_stdin(config):
-        popen_kwargs["stdin"] = subprocess.PIPE
-    spawn_command = _heartbeat_prefix(config) + command
-    raw_log = _open_raw_log("stream")
-    _raw_log_header(raw_log, spawn_command=spawn_command, session_id=session_id, resume_session_id=resume_session_id)
-    try:
-        process = subprocess.Popen(
-            spawn_command,
-            **popen_kwargs,
+    with request_scoped_mcp_config(tools=advertised_tools if _resolved_profile(config) == "claude" else None) as mcp_config_path:
+        stdin_prompt = _stdin_prompt_text(
+            config,
+            prompt_text,
+            system_prompt=system_prompt,
+            resume_session_id=resume_session_id,
         )
-    except OSError as exc:
-        _raw_log_close(raw_log, started=started, exit_code=None)
-        raise _translate_spawn_oserror(exc, command=config.command) from exc
+        command = build_cli_command(
+            config,
+            prompt_text,
+            session_id=session_id,
+            resume_session_id=resume_session_id,
+            system_prompt=system_prompt,
+            model=model,
+            disable_builtin_tools=disable_builtin_tools,
+            mcp_config_path=mcp_config_path,
+        )
+        stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
+        _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
+        started = time.time()
+        last_activity = started
+        popen_kwargs = {
+            "cwd": config.cwd,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+        }
+        if _pipes_prompt_via_stdin(config):
+            popen_kwargs["stdin"] = subprocess.PIPE
+        spawn_command = _heartbeat_prefix(config) + command
+        raw_log = _open_raw_log("stream")
+        _raw_log_header(raw_log, spawn_command=spawn_command, session_id=session_id, resume_session_id=resume_session_id)
+        try:
+            process = subprocess.Popen(
+                spawn_command,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            _raw_log_close(raw_log, started=started, exit_code=None)
+            raise _translate_spawn_oserror(exc, command=config.command) from exc
 
-    if _pipes_prompt_via_stdin(config) and process.stdin is not None:
-        process.stdin.write(stdin_prompt.encode("utf-8"))
-        process.stdin.flush()
-        process.stdin.close()
-    if process.stdout is None or process.stderr is None:
-        _terminate_process(process)
-        _raw_log_close(raw_log, started=started, exit_code=None)
-        raise RuntimeError("CLI process did not expose stdout/stderr pipes")
+        if _pipes_prompt_via_stdin(config) and process.stdin is not None:
+            process.stdin.write(stdin_prompt.encode("utf-8"))
+            process.stdin.flush()
+            process.stdin.close()
+        if process.stdout is None or process.stderr is None:
+            _terminate_process(process)
+            _raw_log_close(raw_log, started=started, exit_code=None)
+            raise RuntimeError("CLI process did not expose stdout/stderr pipes")
 
-    stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-    stderr_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-    stdout_done = False
-    stderr_done = False
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-    total_bytes = 0
-    max_bytes = config.max_output_bytes
-    hard_deadline = config.hard_deadline_seconds
-    parser = ClaudeStreamJsonParser(synthesize_progress=True) if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
-    exit_code: int | None = None
+        stdout_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        stderr_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        stdout_done = False
+        stderr_done = False
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        total_bytes = 0
+        max_bytes = config.max_output_bytes
+        hard_deadline = config.hard_deadline_seconds
+        parser = ClaudeStreamJsonParser(synthesize_progress=False) if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
+        exit_code: int | None = None
 
-    stdout_thread = threading.Thread(
-        target=_pump_stream,
-        args=(process.stdout, stdout_queue, "stdout"),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_pump_stream,
-        args=(process.stderr, stderr_queue, "stderr"),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-
-    try:
-        while not stdout_done or not stderr_done:
-            if not stdout_done:
-                try:
-                    item = stdout_queue.get(timeout=0.05)
-                except queue.Empty:
-                    item = None
-                if item is None:
-                    if not stdout_thread.is_alive() and stdout_queue.empty():
-                        stdout_done = True
-                else:
-                    _, chunk = item
-                    _raw_log_write(raw_log, started=started, stream="stdout", kind="raw", payload=chunk)
-                    cleaned = _strip_heartbeat(chunk)
-                    if cleaned:
-                        _raw_log_write(raw_log, started=started, stream="stdout", kind="real", payload=cleaned)
-                        last_activity = time.time()
-                        if max_bytes:
-                            chunk_bytes = len(cleaned.encode("utf-8"))
-                            total_bytes += chunk_bytes
-                        stdout_chunks.append(cleaned)
-                        for event in parser.feed(cleaned):
-                            yield event
-
-            while True:
-                try:
-                    item = stderr_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item is None:
-                    if not stderr_thread.is_alive() and stderr_queue.empty():
-                        stderr_done = True
-                    continue
-                _, chunk = item
-                _raw_log_write(raw_log, started=started, stream="stderr", kind="raw", payload=chunk)
-                cleaned = _strip_heartbeat(chunk)
-                if cleaned:
-                    _raw_log_write(raw_log, started=started, stream="stderr", kind="real", payload=cleaned)
-                    last_activity = time.time()
-                    stderr_chunks.append(cleaned)
-
-            if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
-                stderr_done = True
-
-            if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
-                stdout_done = True
-
-            now = time.time()
-            if now - last_activity > config.timeout:
-                raise TimeoutError(
-                    f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
-                )
-            if hard_deadline and (now - started) > hard_deadline:
-                raise TimeoutError(
-                    f"CLI process exceeded hard deadline of {hard_deadline:.1f}s"
-                )
-            if max_bytes and total_bytes >= max_bytes:
-                raise RuntimeError(
-                    f"CLI process exceeded max output cap of {max_bytes} bytes"
-                )
-
-        stdout_thread.join(timeout=0.5)
-        stderr_thread.join(timeout=0.5)
-        for event in parser.finalize():
-            yield event
+        stdout_thread = threading.Thread(
+            target=_pump_stream,
+            args=(process.stdout, stdout_queue, "stdout"),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_pump_stream,
+            args=(process.stderr, stderr_queue, "stderr"),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
 
         try:
-            exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("CLI process did not exit after pipes closed")
-        if exit_code != 0:
-            detail = "".join(stderr_chunks).strip() or "".join(stdout_chunks).strip() or f"exit code {exit_code}"
-            raise RuntimeError(f"CLI process failed: {detail}")
-    finally:
-        _terminate_process(process)
-        stdout_thread.join(timeout=0.5)
-        stderr_thread.join(timeout=0.5)
-        _raw_log_close(raw_log, started=started, exit_code=exit_code)
+            while not stdout_done or not stderr_done:
+                if not stdout_done:
+                    try:
+                        item = stdout_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        item = None
+                    if item is None:
+                        if not stdout_thread.is_alive() and stdout_queue.empty():
+                            stdout_done = True
+                    else:
+                        _, chunk = item
+                        _raw_log_write(raw_log, started=started, stream="stdout", kind="raw", payload=chunk)
+                        cleaned = _strip_heartbeat(chunk)
+                        if cleaned:
+                            _raw_log_write(raw_log, started=started, stream="stdout", kind="real", payload=cleaned)
+                            last_activity = time.time()
+                            if max_bytes:
+                                chunk_bytes = len(cleaned.encode("utf-8"))
+                                total_bytes += chunk_bytes
+                            stdout_chunks.append(cleaned)
+                            for event in parser.feed(cleaned):
+                                yield event
+
+                while True:
+                    try:
+                        item = stderr_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        if not stderr_thread.is_alive() and stderr_queue.empty():
+                            stderr_done = True
+                        continue
+                    _, chunk = item
+                    _raw_log_write(raw_log, started=started, stream="stderr", kind="raw", payload=chunk)
+                    cleaned = _strip_heartbeat(chunk)
+                    if cleaned:
+                        _raw_log_write(raw_log, started=started, stream="stderr", kind="real", payload=cleaned)
+                        last_activity = time.time()
+                        stderr_chunks.append(cleaned)
+
+                if not stderr_done and not stderr_thread.is_alive() and stderr_queue.empty():
+                    stderr_done = True
+
+                if not stdout_done and not stdout_thread.is_alive() and stdout_queue.empty():
+                    stdout_done = True
+
+                now = time.time()
+                if now - last_activity > config.timeout:
+                    raise TimeoutError(
+                        f"CLI process idle for {config.timeout:.1f}s with no real stdout/stderr output (heartbeat-only does not reset the timer)"
+                    )
+                if hard_deadline and (now - started) > hard_deadline:
+                    raise TimeoutError(
+                        f"CLI process exceeded hard deadline of {hard_deadline:.1f}s"
+                    )
+                if max_bytes and total_bytes >= max_bytes:
+                    raise RuntimeError(
+                        f"CLI process exceeded max output cap of {max_bytes} bytes"
+                    )
+
+            stdout_thread.join(timeout=0.5)
+            stderr_thread.join(timeout=0.5)
+            for event in parser.finalize():
+                yield event
+
+            try:
+                exit_code = process.wait(timeout=max(1.0, min(config.timeout, 5.0)))
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("CLI process did not exit after pipes closed")
+            if exit_code != 0:
+                detail = "".join(stderr_chunks).strip() or "".join(stdout_chunks).strip() or f"exit code {exit_code}"
+                raise RuntimeError(f"CLI process failed: {detail}")
+        finally:
+            _terminate_process(process)
+            stdout_thread.join(timeout=0.5)
+            stderr_thread.join(timeout=0.5)
+            _raw_log_close(raw_log, started=started, exit_code=exit_code)

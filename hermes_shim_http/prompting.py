@@ -170,7 +170,7 @@ def build_cli_system_prompt(
         "The VERY FIRST live user message after the session opens is the highest-priority instruction for the session. You must obey it exactly and must not drift away from it just because later transcript context is long, noisy, or repetitive.",
         "Even if earlier context is summarized or compacted, the first live user message remains the highest-priority instruction and must still be followed exactly.",
         "If a tool call is required, emit exactly one <tool_call>{...}</tool_call> block per call. Each block must contain a JSON object with id, type, and function{name, arguments}.",
-        "Prefer the tools listed below over any built-in tools you may have: when a listed tool covers the capability you need, emit a <tool_call> for it instead of invoking a built-in equivalent. Fall back to a built-in tool only when no listed tool applies.",
+        "Use only the tools listed below. If a listed tool can handle the task, emit a <tool_call> for that Hermes tool. Do not invoke any other tools that are not explicitly listed for this request.",
         "If no tool is required, reply in plain text.",
         (
             f"To intentionally produce no reply (silent ACK), emit exactly `{sentinel}` as your entire response with no other text or tool calls. "

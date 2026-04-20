@@ -29,6 +29,18 @@ from typing import Any, Callable
 _Translator = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
 
 
+def _translate_hermes_mcp_prefixed(name: str, *, allowed_names: set[str] | None) -> str | None:
+    prefix = "mcp__hermes__"
+    if not isinstance(name, str) or not name.startswith(prefix):
+        return None
+    translated = name[len(prefix):].strip()
+    if not translated:
+        return None
+    if allowed_names is not None and translated not in allowed_names:
+        return None
+    return translated
+
+
 def _rename(mapping: dict[str, str], *, target: str, extra: dict[str, Any] | None = None) -> _Translator:
     def translate(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         out: dict[str, Any] = {}
@@ -197,6 +209,15 @@ def translate_tool_call(tool_call: dict[str, Any], *, allowed_names: set[str] | 
     name = str(fn.get("name") or "").strip()
     if not name:
         return tool_call
+    hermes_mcp_name = _translate_hermes_mcp_prefixed(name, allowed_names=allowed_names)
+    if hermes_mcp_name:
+        return {
+            **tool_call,
+            "function": {
+                **fn,
+                "name": hermes_mcp_name,
+            },
+        }
     if allowed_names is not None and name in allowed_names:
         return tool_call
     translator = _TRANSLATORS.get(name)

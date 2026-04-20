@@ -144,7 +144,7 @@ def test_claude_stream_parser_ignores_thinking_delta():
     assert events == []
 
 
-def test_claude_stream_parser_can_synthesize_progress_text_for_thinking():
+def test_claude_stream_parser_does_not_emit_progress_text_for_thinking():
     parser = ClaudeStreamJsonParser(synthesize_progress=True)
     blob = _stream_json(
         {"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}},
@@ -157,12 +157,12 @@ def test_claude_stream_parser_can_synthesize_progress_text_for_thinking():
 
     texts = [e.text for e in events if e.kind == "text"]
     tool_events = [e for e in events if e.kind == "tool_call"]
-    assert texts == ["Thinking...\n\n"]
+    assert texts == []
     assert len(tool_events) == 1
     assert tool_events[0].tool_call["function"]["name"] == "read_file"
 
 
-def test_claude_stream_parser_dedups_thinking_within_a_turn():
+def test_claude_stream_parser_never_emits_thinking_progress_within_a_turn():
     parser = ClaudeStreamJsonParser(synthesize_progress=True)
     blob = _stream_json(
         {"type": "stream_event", "event": {"type": "message_start"}},
@@ -175,10 +175,10 @@ def test_claude_stream_parser_dedups_thinking_within_a_turn():
     )
     events = parser.feed(blob) + parser.finalize()
     texts = [e.text for e in events if e.kind == "text"]
-    assert texts == ["Thinking...\n\n"]
+    assert texts == []
 
 
-def test_claude_stream_parser_emits_thinking_once_per_message_turn():
+def test_claude_stream_parser_never_emits_thinking_progress_across_turns():
     parser = ClaudeStreamJsonParser(synthesize_progress=True)
     blob = _stream_json(
         {"type": "stream_event", "event": {"type": "message_start"}},
@@ -192,7 +192,7 @@ def test_claude_stream_parser_emits_thinking_once_per_message_turn():
     )
     events = parser.feed(blob) + parser.finalize()
     texts = [e.text for e in events if e.kind == "text"]
-    assert texts == ["Thinking...\n\n", "Thinking...\n\n"]
+    assert texts == []
 
 
 def test_claude_stream_parser_assembles_tool_use():

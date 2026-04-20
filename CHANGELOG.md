@@ -2,6 +2,16 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.25] - 2026-04-19
+
+### Changed
+- **Anthropic-provider parity mode is now the default behavior.** The shim no longer treats Claude built-ins as a fallback execution path when Hermes advertises tools. Claude is launched with built-ins disabled (`--tools ""`) and receives only the request-scoped Hermes tool surface, so tool availability now follows the same explicit-request contract as a pure provider API call instead of diverging into CLI-only fallback behavior.
+- **Hermes tools are now exposed to the shim-owned Claude subprocess as request-scoped MCP only.** Rather than relying on prompt-only tool descriptions or any persistent user/global Claude MCP state, the shim creates a per-request temporary `--mcp-config` that points at a shim-owned stdio MCP bridge (`bin/hermes-tools-mcp.py`). This keeps direct local `claude` usage untouched while making shim-launched Claude see only the tools explicitly advertised on that request.
+
+### Fixed
+- **Shim-added Discord/UI progress noise has been removed from streaming outputs.** The shim no longer synthesizes `Thinking...`, `Using tool: ...`, or tool-argument preview text into streamed assistant content. Chat/responses streaming now forwards only normalized assistant text and tool-call deltas, which makes shim output much closer to direct provider semantics and removes the most distracting Discord noise.
+- **Hermes MCP-prefixed tool names are normalized back into canonical Hermes tool calls.** When Claude selects a shim-owned MCP tool like `mcp__hermes__read_file`, the shim now remaps it back to `read_file` before allowlist enforcement and response shaping, so the upstream Hermes execution path stays identical to the non-MCP tool-call shape.
+
 ## [0.1.24] - 2026-04-19
 
 ### Fixed

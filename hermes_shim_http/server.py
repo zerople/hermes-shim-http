@@ -778,7 +778,8 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
         resume_session_id=session_plan.resume_session_id,
         system_prompt=session_plan.system_prompt_text,
         model=model,
-        disable_builtin_tools=bool(allowed_tool_names),
+        disable_builtin_tools=True,
+        advertised_tools=session_plan.tools,
     )
     recorded = False
     try:
@@ -796,11 +797,6 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
                     pending_text += fallback_text
                     assistant_text_chunks.append(fallback_text)
                     continue
-                args_preview = _tool_progress_preview(name, tool_call.get("function", {}).get("arguments"))
-                tool_progress_text = f"Using tool: {name}{args_preview}\n\n" if name else ""
-                if tool_progress_text:
-                    pending_text += tool_progress_text
-                    assistant_text_chunks.append(tool_progress_text)
                 yield from _flush_pending_chat_text(completion_id=completion_id, created=created, model=model, pending_text=pending_text)
                 pending_text = ""
                 saw_tool_calls = True
@@ -853,7 +849,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
             emit_log(logger, event="stream_aborted", request_id=request_id, model=model)
 
 
-def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, system_prompt: str | None, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, compacted: bool) -> Iterator[bytes]:
+def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logging.Logger, model: str, prompt: str, system_prompt: str | None, request_messages: list[dict[str, Any]], config: ShimConfig, allowed_tool_names: set[str] | None, normalized_tools: list[dict[str, Any]] | None, compacted: bool) -> Iterator[bytes]:
     response_id = f"resp_{uuid.uuid4().hex[:28]}"
     created_at = int(time.time())
     pending_text = ""
@@ -892,7 +888,7 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         pending_text_output_index = output_index
         yield _sse_line({"type": "response.output_item.added", "output_index": pending_text_output_index, "item": {"type": "message", "id": pending_text_item_id, "role": "assistant", "status": "in_progress", "content": []}})
 
-    source = stream_cli_prompt(prompt, config, model=model, system_prompt=system_prompt, disable_builtin_tools=bool(allowed_tool_names))
+    source = stream_cli_prompt(prompt, config, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools)
     try:
         for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
@@ -1079,6 +1075,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 "child_interval_seconds": cfg.heartbeat_interval,
                 "http_interval_seconds": cfg.http_heartbeat_interval,
             },
+            "strict_mcp_config": cfg.strict_mcp_config,
         }
 
     @app.get("/health")
@@ -1205,7 +1202,8 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 resume_session_id=session_plan.resume_session_id,
                 system_prompt=session_plan.system_prompt_text,
                 model=request.model,
-                disable_builtin_tools=bool(allowed_tool_names),
+                disable_builtin_tools=True,
+                advertised_tools=session_plan.tools,
             )
             parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
             session_cache.record_success(
@@ -1288,7 +1286,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         headers = {"X-Request-Id": request_id, **({"X-Context-Compacted": "true"} if compacted else {})}
         if body.get("stream"):
             emit_log(logger, event="spawn", request_id=request_id, model=model, stream=True)
-            inner_stream = _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, system_prompt=system_prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, compacted=compacted)
+            inner_stream = _stream_live_responses_events(app=app, request_id=request_id, logger=logger, model=model, prompt=prompt, system_prompt=system_prompt, request_messages=compacted_messages, config=cfg, allowed_tool_names=allowed_tool_names, normalized_tools=normalized_tools, compacted=compacted)
             return StreamingResponse(
                 _release_on_exit(inner_stream, app.state.in_flight, idempotency_key),
                 media_type="text/event-stream",
@@ -1298,7 +1296,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
 
         def _run_responses() -> dict[str, Any]:
-            result = run_cli_prompt(prompt, cfg, model=model, system_prompt=system_prompt, disable_builtin_tools=bool(allowed_tool_names))
+            result = run_cli_prompt(prompt, cfg, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools)
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
             usage = _estimate_usage_for(model, messages=compacted_messages, response_text=parsed.content)
@@ -1359,6 +1357,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Base path for resumed-session lock files (default: /tmp/hermes-shim-http-<port>.child.lock).")
     parser.add_argument("--http-heartbeat-interval", dest="http_heartbeat_interval", type=float, default=30.0,
                         help="Seconds between whitespace heartbeat bytes on non-streaming HTTP responses. 0 disables (default: 30.0).")
+    parser.add_argument("--strict-mcp-config", dest="strict_mcp_config", action=argparse.BooleanOptionalAction, default=True,
+                        help="For Claude, pass --strict-mcp-config so shim sessions ignore user/project/global MCP configs and only use explicitly provided MCP configs (default: enabled).")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
 
@@ -1387,6 +1387,7 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "heartbeat_interval": config.heartbeat_interval,
         "http_heartbeat_interval": config.http_heartbeat_interval,
         "single_child_lock_path": config.single_child_lock_path,
+        "strict_mcp_config": config.strict_mcp_config,
     }
 
 
@@ -1419,6 +1420,7 @@ def main() -> None:
             if ns.single_child_lock
             else None
         ),
+        strict_mcp_config=ns.strict_mcp_config,
     )
     import uvicorn
 

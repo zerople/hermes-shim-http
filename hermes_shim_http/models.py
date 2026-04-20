@@ -74,3 +74,4 @@ class ShimConfig(BaseModel):
     hard_deadline_seconds: float = Field(default=1800.0, ge=0.0)
     max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=0)
     single_child_lock_path: Optional[str] = None
+    strict_mcp_config: bool = True

@@ -248,6 +248,9 @@ class TestRunner:
             "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
+            "--strict-mcp-config",
+            "--tools",
+            "",
         ]
 
     def test_build_cli_command_uses_profile_defaults_for_supported_clis(self):
@@ -263,6 +266,9 @@ class TestRunner:
             "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
+            "--strict-mcp-config",
+            "--tools",
+            "",
         ]
         assert build_cli_command(ShimConfig(command="codex", args=[]), "hello") == ["codex", "exec", "hello"]
         assert build_cli_command(ShimConfig(command="opencode", args=[]), "hello") == ["opencode", "run", "hello"]
@@ -286,6 +292,9 @@ class TestRunner:
             "opus",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
+            "--strict-mcp-config",
+            "--tools",
+            "",
         ]
 
     def test_build_cli_command_uses_append_only_for_new_claude_session(self):
@@ -308,6 +317,9 @@ class TestRunner:
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--strict-mcp-config",
+            "--tools",
+            "",
             "--resume",
             "22222222-2222-2222-2222-222222222222",
             "--fork-session",
@@ -337,13 +349,16 @@ class TestRunner:
             "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
+            "--strict-mcp-config",
+            "--tools",
+            "",
             "--model",
             "opus",
             "--fallback-model",
             "haiku",
         ]
 
-    def test_build_cli_command_disables_builtin_tools_for_claude(self):
+    def test_build_cli_command_can_disable_builtin_tools_for_claude_in_strict_mode(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
 
         cmd = build_cli_command(cfg, "hello", disable_builtin_tools=True)
@@ -351,7 +366,7 @@ class TestRunner:
         assert "--tools" in cmd
         assert cmd[cmd.index("--tools") + 1] == ""
 
-    def test_build_cli_command_disables_builtin_tools_on_resume(self):
+    def test_build_cli_command_can_disable_builtin_tools_on_resume_in_strict_mode(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
 
         cmd = build_cli_command(
@@ -366,12 +381,28 @@ class TestRunner:
         assert cmd[cmd.index("--tools") + 1] == ""
         assert "--append-system-prompt" not in cmd
 
-    def test_build_cli_command_omits_tools_flag_when_disable_is_false(self):
+    def test_build_cli_command_disables_builtin_tools_for_claude_by_default(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
 
-        cmd = build_cli_command(cfg, "hello", disable_builtin_tools=False)
+        cmd = build_cli_command(cfg, "hello")
 
-        assert "--tools" not in cmd
+        assert "--tools" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+
+    def test_build_cli_command_can_disable_strict_mcp_config(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work", strict_mcp_config=False)
+
+        cmd = build_cli_command(cfg, "hello")
+
+        assert "--strict-mcp-config" not in cmd
+
+    def test_build_cli_command_adds_request_scoped_mcp_config_when_provided(self):
+        cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
+
+        cmd = build_cli_command(cfg, "hello", mcp_config_path="/tmp/hermes-mcp.json")
+
+        assert "--mcp-config" in cmd
+        assert cmd[cmd.index("--mcp-config") + 1] == "/tmp/hermes-mcp.json"
 
     def test_build_cli_command_ignores_non_meaningful_model_for_claude(self):
         cfg = ShimConfig(command="claude", args=[], cwd="/tmp/work")
@@ -390,6 +421,9 @@ class TestRunner:
             "--include-partial-messages",
             "--append-system-prompt",
             _CLAUDE_APPEND_PROMPT,
+            "--strict-mcp-config",
+            "--tools",
+            "",
         ]
 
     def test_build_cli_command_prepends_system_prompt_for_non_claude_cli(self):
@@ -426,6 +460,9 @@ class TestRunner:
                 "--include-partial-messages",
                 "--append-system-prompt",
                 _CLAUDE_APPEND_PROMPT,
+                "--strict-mcp-config",
+            "--tools",
+            "",
                 "--model",
                 "sonnet",
             ],
@@ -461,6 +498,9 @@ class TestRunner:
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
+                "--strict-mcp-config",
+            "--tools",
+            "",
                 "--model",
                 "sonnet",
                 "--resume",
@@ -632,6 +672,9 @@ class TestRunner:
                 "--include-partial-messages",
                 "--append-system-prompt",
                 _CLAUDE_APPEND_PROMPT,
+                "--strict-mcp-config",
+            "--tools",
+            "",
             ],
             cwd="/tmp/work",
             stdout=subprocess.PIPE,
@@ -704,6 +747,9 @@ class TestRunner:
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
+                "--strict-mcp-config",
+            "--tools",
+            "",
                 "--model",
                 "sonnet",
                 "--resume",
@@ -910,7 +956,7 @@ class TestRunner:
 
         texts = [e.text for e in events if e.kind == "text"]
         tool_calls = [e for e in events if e.kind == "tool_call"]
-        assert "".join(texts) == "Thinking...\n\nStreaming hello from claude"
+        assert "".join(texts) == "Streaming hello from claude"
         assert tool_calls == []
 
     def test_stream_cli_prompt_claude_stream_json_emits_tool_use(self):

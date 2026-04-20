@@ -122,6 +122,19 @@ def test_allowed_name_passthrough_unchanged():
     assert translate_tool_call(call, allowed_names=ALLOWED) == call
 
 
+def test_hermes_mcp_prefixed_tool_maps_back_to_allowed_name():
+    call = _call("mcp__hermes__read_file", {"path": "/x"})
+    out = translate_tool_call(call, allowed_names=ALLOWED)
+    assert out["function"]["name"] == "read_file"
+    assert _args(out) == {"path": "/x"}
+
+
+def test_hermes_mcp_prefixed_tool_stays_unchanged_when_not_allowed():
+    call = _call("mcp__hermes__browser_navigate", {"url": "https://example.com"})
+    out = translate_tool_call(call, allowed_names=ALLOWED)
+    assert out == call
+
+
 def test_unknown_native_tool_unchanged():
     call = _call("WebSearch", {"query": "hi"})
     assert translate_tool_call(call, allowed_names=ALLOWED) == call

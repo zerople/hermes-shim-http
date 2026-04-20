@@ -312,14 +312,6 @@ class ClaudeStreamJsonParser:
         return []
 
     def _progress_events_for_block_start(self, block: dict[str, Any]) -> list[CliStreamEvent]:
-        if not self._synthesize_progress:
-            return []
-        block_type = str(block.get("type") or "").strip()
-        if block_type == "thinking":
-            if self._thinking_emitted_this_turn:
-                return []
-            self._thinking_emitted_this_turn = True
-            return [CliStreamEvent(kind="text", text="Thinking...\n\n")]
         return []
 
     def _normalize_tool_use(

@@ -112,6 +112,7 @@ def test_info_endpoint_reports_capabilities_and_context_window_for_claude():
     assert payload["capabilities"]["session_resume"] is True
     assert payload["api_modes"] == ["chat_completions", "responses"]
     assert payload["models"][0]["context_length"] == 200_000
+    assert payload["strict_mcp_config"] is True
 
 
 def test_info_endpoint_reports_1m_context_for_opus():
@@ -256,7 +257,7 @@ def test_chat_completions_returns_tool_calls():
             exit_code=0,
             duration_ms=10,
         ),
-    ):
+    ) as mock_run:
         response = client.post(
             "/v1/chat/completions",
             json={
@@ -279,6 +280,36 @@ def test_chat_completions_returns_tool_calls():
     payload = response.json()
     assert payload["choices"][0]["finish_reason"] == "tool_calls"
     assert payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert mock_run.call_args.kwargs["disable_builtin_tools"] is True
+
+
+def test_chat_completions_disables_claude_builtin_tools_when_hermes_tools_are_advertised():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="ok", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "Read the readme"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "Read a file",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_run.call_args.kwargs["disable_builtin_tools"] is True
 
 
 def test_chat_completions_reuses_prefix_matched_session_on_followup_request():
@@ -391,7 +422,6 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
         "hermes_shim_http.server.stream_cli_prompt",
         return_value=iter(
             [
-                CliStreamEvent(kind="text", text="Using tool: read_file\n"),
                 CliStreamEvent(
                     kind="tool_call",
                     tool_call={
@@ -429,36 +459,14 @@ def test_chat_completions_streaming_returns_live_tool_call_chunks():
 
     assert response.status_code == 200
     assert "text/event-stream" in response.headers["content-type"]
-    assert 'Using tool: read_file ```path=README.md```' in body
+    assert 'Using tool:' not in body
     assert '"tool_calls"' in body
     assert '"read_file"' in body
     assert '"finish_reason": "tool_calls"' in body
     assert "data: [DONE]" in body
 
 
-def test_tool_progress_preview_shows_primary_args_inline():
-    from hermes_shim_http.server import _tool_progress_preview
-
-    assert _tool_progress_preview("terminal", '{"command":"git status"}') == " ```command=git status```"
-    assert _tool_progress_preview("read_file", {"path": "/etc/hosts", "offset": 1}) == " ```path=/etc/hosts```"
-    assert _tool_progress_preview("patch", '{"path":"a.py","mode":"replace"}') == " ```path=a.py mode=replace```"
-    assert _tool_progress_preview("search_files", '{"pattern":"TODO","path":"src"}') == " ```pattern=TODO path=src```"
-    # Long values are truncated with an ellipsis so the progress line stays compact.
-    long_cmd = "x" * 200
-    preview = _tool_progress_preview("terminal", json.dumps({"command": long_cmd}))
-    assert preview.startswith(" ```command=")
-    assert preview.endswith("…```")
-    assert len(preview) < 110
-    # Newlines collapse to a single space.
-    assert _tool_progress_preview("terminal", '{"command":"a\\nb"}') == " ```command=a b```"
-    # Unknown tool with a single scalar arg surfaces it; empty payload stays silent.
-    assert _tool_progress_preview("some_future_tool", '{"query":"hi"}') == " ```query=hi```"
-    assert _tool_progress_preview("terminal", "") == ""
-    assert _tool_progress_preview("terminal", "{not json") == ""
-    assert _tool_progress_preview("", '{"command":"x"}') == ""
-
-
-def test_chat_completions_streaming_progress_text_omits_preview_when_no_primary_field():
+def test_chat_completions_streaming_tool_calls_emit_no_progress_text():
     client = _client()
 
     with patch(
@@ -472,7 +480,6 @@ def test_chat_completions_streaming_progress_text_omits_preview_when_no_primary_
                         "type": "function",
                         "function": {
                             "name": "terminal",
-                            # Empty args dict — preview should stay quiet so we don't print "Using tool: terminal \n".
                             "arguments": "{}",
                         },
                     },
@@ -501,8 +508,8 @@ def test_chat_completions_streaming_progress_text_omits_preview_when_no_primary_
         ) as response:
             body = response.read().decode()
 
-    assert "Using tool: terminal\\n" in body
-    assert "Using tool: terminal \\n" not in body
+    assert "Using tool:" not in body
+    assert "Thinking..." not in body
 
 
 def test_chat_completions_drops_native_claude_tool_without_hermes_equivalent():
