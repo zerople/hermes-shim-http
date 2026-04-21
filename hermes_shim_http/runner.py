@@ -22,7 +22,6 @@ from .parsing import (
     parse_claude_stream_metadata,
     parse_cli_output,
 )
-from .hermes_mcp import request_scoped_mcp_config
 from .single_child import ChildLockBusy, acquire_single_child_lock
 from .telemetry import emit_event
 
@@ -440,6 +439,8 @@ def run_cli_prompt(
             and (session_id or resume_session_id)
         )
         pool_result: LiveChildTurnResult | None = None
+        pool_key: str | None = None
+        fingerprint: str | None = None
         if use_live_pool:
             fingerprint = _live_child_pool_fingerprint(
                 config,
@@ -481,6 +482,19 @@ def run_cli_prompt(
                     )
                 )
                 pool_result = captured[0] if captured else LiveChildTurnResult(stdout="", stderr="", session_id=None, is_error=False)
+                if (
+                    pool_result.session_id
+                    and not resume_session_id
+                    and fingerprint
+                ):
+                    live_child_pool.rekey(
+                        pool_key,
+                        _live_child_pool_session_key(
+                            session_id=pool_result.session_id,
+                            resume_session_id=None,
+                            fingerprint=fingerprint,
+                        ) or pool_key,
+                    )
 
         if pool_result is not None:
             stdout_text = pool_result.stdout
@@ -747,6 +761,7 @@ def stream_cli_prompt(
                 )
                 stdin_bytes = len(_build_claude_stdin_payload(pool_prompt).encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
                 _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
+                captured: list[LiveChildTurnResult] = []
                 yield from live_child_pool.stream(
                     pool_key,
                     pool_prompt,
@@ -763,7 +778,21 @@ def stream_cli_prompt(
                     read_timeout=config.timeout,
                     hard_deadline=config.hard_deadline_seconds,
                     max_output_bytes=config.max_output_bytes,
+                    on_complete=captured.append,
                 )
+                if (
+                    captured
+                    and captured[0].session_id
+                    and not resume_session_id
+                ):
+                    live_child_pool.rekey(
+                        pool_key,
+                        _live_child_pool_session_key(
+                            session_id=captured[0].session_id,
+                            resume_session_id=None,
+                            fingerprint=fingerprint,
+                        ) or pool_key,
+                    )
                 return
 
     lock_path = _child_lock_path_for_request(

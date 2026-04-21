@@ -56,7 +56,17 @@ def _emit_claude_stream_json(prompt: str) -> None:
 
 
 def _emit_multiturn_response(prompt: str) -> None:
-    reply = f"echo:{prompt.strip()}"
+    stripped = prompt.strip()
+    reply = f"echo:{stripped}"
+    if stripped.startswith("sleep:"):
+        head, _, rest = stripped.partition(" ")
+        try:
+            delay = float(head.split(":", 1)[1])
+        except Exception:
+            delay = 0.0
+        if delay > 0:
+            time.sleep(delay)
+        reply = f"echo:{rest or stripped}"
     _emit_claude_event({
         "type": "stream_event",
         "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
