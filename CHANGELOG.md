@@ -2,6 +2,18 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.26] - 2026-04-20
+
+### Added
+- **Optional in-process live child pool for Claude multi-turn reuse.** New `--live-child-pool`, `--live-child-pool-size`, and `--live-child-pool-idle-ttl` flags let the shim keep one long-lived Claude stream-json subprocess per active conversation and reuse it across turns when the same conversation stays on the same shim process. Reuse is keyed by conversation lineage plus spawn-context fingerprint so mismatched model/tool/MCP/system-prompt contexts do not accidentally share a child.
+
+### Changed
+- **`run_cli_prompt` and `stream_cli_prompt` can now route Claude turns through the live child pool.** Fresh Claude turns create a pooled child when enabled; later turns reuse the same child if it is still alive, otherwise they cleanly fall back to the existing `--resume ... --fork-session` cold-spawn path. This keeps the prior session-cache/resume mechanism as the durability fallback rather than replacing it.
+- **FastAPI app lifecycle now owns pooled-child shutdown.** `create_app()` instantiates the pool from `ShimConfig` when enabled and closes all live children via lifespan shutdown, so test clients and real server exits do not leak Claude subprocesses.
+
+### Fixed
+- **Live-child prototype is now fully wired into real request paths.** The previous branch state only had a standalone `live_child_pool.py` + fake CLI tests; none of `runner.py` / `server.py` used it. 0.1.26 wires the pool into chat-completions and responses, streaming and non-streaming paths, with end-to-end server tests proving reuse across actual HTTP requests.
+
 ## [0.1.25] - 2026-04-19
 
 ### Changed

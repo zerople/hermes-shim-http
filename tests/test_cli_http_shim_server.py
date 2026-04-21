@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,10 @@ from fastapi.testclient import TestClient
 from hermes_shim_http import __version__
 from hermes_shim_http.models import CliRunResult, CliStreamEvent, ShimConfig
 from hermes_shim_http.server import create_app
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FAKE_CLI = REPO_ROOT / "tests" / "fake_cli.py"
 
 
 def _client():
@@ -34,6 +39,49 @@ def _client_with_config(**overrides):
         **overrides,
     )
     return TestClient(create_app(config))
+
+
+def test_chat_completions_reuses_live_child_pool_when_enabled():
+    app = create_app(
+        ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-multiturn"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            http_heartbeat_interval=0,
+            cli_profile="claude",
+            models=["claude-cli"],
+            heartbeat_wrap=False,
+            live_child_pool=True,
+        )
+    )
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        assert first.status_code == 200
+        first_text = first.json()["choices"][0]["message"]["content"]
+        pool_key = next(iter(app.state.live_child_pool._children.keys()))
+        pid1 = app.state.live_child_pool.peek_pid(pool_key)
+
+        second = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-cli",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": first_text},
+                    {"role": "user", "content": "world"},
+                ],
+            },
+        )
+        assert second.status_code == 200
+        pid2 = app.state.live_child_pool.peek_pid(pool_key)
+
+    assert pid1 is not None and pid1 == pid2
+
 
 
 def test_models_endpoint_returns_configured_models():

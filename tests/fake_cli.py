@@ -55,6 +55,21 @@ def _emit_claude_stream_json(prompt: str) -> None:
     _emit_claude_event({"type": "result", "subtype": "success"})
 
 
+def _emit_multiturn_response(prompt: str) -> None:
+    reply = f"echo:{prompt.strip()}"
+    _emit_claude_event({
+        "type": "stream_event",
+        "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+    })
+    _emit_claude_event({
+        "type": "stream_event",
+        "event": {"type": "content_block_delta", "index": 0,
+                  "delta": {"type": "text_delta", "text": reply}},
+    })
+    _emit_claude_event({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}})
+    _emit_claude_event({"type": "result", "subtype": "success"})
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="legacy")
@@ -77,7 +92,8 @@ def main() -> int:
     args = parser.parse_args()
     prompt = args.prompt or ""
     # Claude profile pipes the prompt via stdin; read it opportunistically.
-    if not prompt and not sys.stdin.isatty():
+    # Multiturn mode reads stdin line-by-line in its own loop.
+    if not prompt and not sys.stdin.isatty() and args.mode != "claude-multiturn":
         try:
             stdin_text = sys.stdin.read()
         except Exception:
@@ -138,6 +154,29 @@ def main() -> int:
     if args.mode == "claude-stream-json":
         _emit_claude_stream_json(prompt)
         return 0
+
+    if args.mode == "claude-multiturn":
+        session_id = args.session_id or "fake-session"
+        _emit_claude_event({"type": "system", "subtype": "init", "session_id": session_id})
+        if prompt:
+            _emit_multiturn_response(prompt)
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                return 0
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("type") != "user":
+                continue
+            content = msg.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                texts = [p.get("text", "") for p in content if isinstance(p, dict)]
+                turn_prompt = "".join(texts)
+            else:
+                turn_prompt = str(content or "")
+            _emit_multiturn_response(turn_prompt)
 
     if args.mode == "flood":
         # Emit args.duration megabytes as fast as possible.
