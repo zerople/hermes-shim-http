@@ -128,7 +128,7 @@ class TestPrompting:
         assert "additionalProperties" not in system_prompt
         assert '"properties"' not in system_prompt
 
-    def test_build_cli_user_prompt_uses_xml_tags_for_roles(self):
+    def test_build_cli_user_prompt_uses_turn_markers_for_roles(self):
         prompt = build_cli_user_prompt(
             messages=[
                 {"role": "system", "content": "You are helpful."},
@@ -138,10 +138,12 @@ class TestPrompting:
             ]
         )
 
-        assert "<system>\nYou are helpful.\n</system>" in prompt
-        assert "<user>\nCheck the repo.\n</user>" in prompt
-        assert "<assistant>\nSure.\n</assistant>" in prompt
-        assert "<tool>\n{\"ok\": true}\n</tool>" in prompt
+        assert "----- turn:system -----\nYou are helpful.\n----- end -----" in prompt
+        assert "----- turn:user -----\nCheck the repo.\n----- end -----" in prompt
+        assert "----- turn:assistant -----\nSure.\n----- end -----" in prompt
+        assert "----- turn:tool -----\n{\"ok\": true}\n----- end -----" in prompt
+        assert "<system>" not in prompt
+        assert "</system>" not in prompt
         assert "Assistant:" not in prompt
         assert "User:" not in prompt
 
@@ -178,7 +180,7 @@ class TestPrompting:
 
         assert "reasoning backend" in prompt
         assert "Requested model: sonnet" in prompt
-        assert "<user>\nHi\n</user>" in prompt
+        assert "----- turn:user -----\nHi\n----- end -----" in prompt
         assert "Assistant:" not in prompt
 
 
@@ -1076,7 +1078,7 @@ class TestSessionCache:
         )
 
         assert second.resume_session_id == first.session_id
-        assert second.prompt_text == "<user>\ncontinue\n</user>"
+        assert second.prompt_text == "----- turn:user -----\ncontinue\n----- end -----"
         assert second.prefix_message_count == 2
         assert second.system_prompt_text is not None
         assert "reasoning backend" in second.system_prompt_text
@@ -1092,7 +1094,7 @@ class TestSessionCache:
         )
 
         assert plan.resume_session_id is None
-        assert plan.prompt_text == "<user>\nhello\n</user>"
+        assert plan.prompt_text == "----- turn:user -----\nhello\n----- end -----"
         assert plan.system_prompt_text is not None
         assert "reasoning backend" in plan.system_prompt_text
 
@@ -1123,7 +1125,7 @@ class TestSessionCache:
 
         assert second.resume_session_id == first.session_id
         assert second.prefix_message_count == 3
-        assert second.prompt_text == "<user>\ncontinue\n</user>"
+        assert second.prompt_text == "----- turn:user -----\ncontinue\n----- end -----"
 
     def test_plan_request_does_not_resume_from_partial_prefix_after_divergence(self):
         cache = SessionCache()
@@ -1155,7 +1157,7 @@ class TestSessionCache:
 
         assert second.resume_session_id is None
         assert second.prefix_message_count == 0
-        assert second.prompt_text == "<user>\nhello\n</user>\n\n<assistant>\nhi\n</assistant>\n\n<user>\nnew branch\n</user>"
+        assert second.prompt_text == "----- turn:user -----\nhello\n----- end -----\n\n----- turn:assistant -----\nhi\n----- end -----\n\n----- turn:user -----\nnew branch\n----- end -----"
 
     def test_plan_request_distinguishes_assistant_tool_calls_between_branches(self):
         cache = SessionCache()

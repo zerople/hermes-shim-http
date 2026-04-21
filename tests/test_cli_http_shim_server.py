@@ -291,7 +291,7 @@ def test_non_claude_chat_completions_keep_full_transcript_without_resume():
         )
 
     assert response.status_code == 200
-    assert "<user>\nhello\n</user>\n\n<assistant>\nhi\n</assistant>\n\n<user>\ncontinue\n</user>" in mock_run.call_args.args[0]
+    assert "----- turn:user -----\nhello\n----- end -----\n\n----- turn:assistant -----\nhi\n----- end -----\n\n----- turn:user -----\ncontinue\n----- end -----" in mock_run.call_args.args[0]
     assert mock_run.call_args.kwargs["resume_session_id"] is None
 
 
