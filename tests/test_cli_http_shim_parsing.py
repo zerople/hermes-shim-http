@@ -354,3 +354,35 @@ def test_claude_stream_parser_extracts_tool_call_tags_from_aggregate_text():
     rendered = "".join(e.text for e in text_events)
     assert "<tool_call>" not in rendered
     assert "prefix" in rendered and "suffix" in rendered
+
+
+def test_parse_cli_output_tolerates_tool_call_close_tag_in_arguments():
+    close = "<" + "/" + "tool_call>"
+    open_ = "<tool_call>"
+    inner_note = "see " + open_ + "{...}" + close + " protocol"
+    args = json.dumps({"note": inner_note})
+    block_obj = {"id": "call_1", "type": "function", "function": {"name": "patch", "arguments": args}}
+    text = "before " + open_ + json.dumps(block_obj) + close + " after"
+    parsed = parse_cli_output(text)
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0]["function"]["name"] == "patch"
+    assert parsed.tool_calls[0]["function"]["arguments"] == args
+    assert open_ not in parsed.content and close not in parsed.content
+    assert "before" in parsed.content and "after" in parsed.content
+
+
+def test_incremental_parser_tolerates_tool_call_close_tag_in_arguments():
+    close = "<" + "/" + "tool_call>"
+    open_ = "<tool_call>"
+    args = json.dumps({"note": "embedded " + open_ + "{}" + close + " marker"})
+    block_obj = {"id": "call_1", "type": "function", "function": {"name": "patch", "arguments": args}}
+    payload = "lead " + open_ + json.dumps(block_obj) + close + " tail"
+    parser = IncrementalToolCallParser()
+    events = parser.feed(payload) + parser.finalize()
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    text_events = [e for e in events if e.kind == "text" and e.text]
+    assert len(tool_events) == 1
+    assert tool_events[0].tool_call["function"]["name"] == "patch"
+    rendered = "".join(e.text for e in text_events)
+    assert open_ not in rendered and close not in rendered
+    assert "lead" in rendered and "tail" in rendered

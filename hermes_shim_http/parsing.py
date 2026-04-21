@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 from dataclasses import dataclass
 
 from .models import CliStreamEvent, ParsedShimOutput
 from .silence import detect_and_strip as _detect_silent
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_JSON_DECODER = json.JSONDecoder()
 _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_CLOSE = "</tool_call>"
 
@@ -45,6 +44,24 @@ def _normalize_tool_call(raw_obj: dict[str, Any], index: int) -> dict[str, Any] 
     }
 
 
+def _try_extract_tool_call(buffer: str, open_idx: int) -> tuple[int, dict[str, Any]] | None:
+    json_start = open_idx + len(_TOOL_CALL_OPEN)
+    while json_start < len(buffer) and buffer[json_start].isspace():
+        json_start += 1
+    if json_start >= len(buffer) or buffer[json_start] != "{":
+        return None
+    try:
+        obj, end_idx = _JSON_DECODER.raw_decode(buffer, json_start)
+    except json.JSONDecodeError:
+        return None
+    close_scan = end_idx
+    while close_scan < len(buffer) and buffer[close_scan].isspace():
+        close_scan += 1
+    if not buffer.startswith(_TOOL_CALL_CLOSE, close_scan):
+        return None
+    return close_scan + len(_TOOL_CALL_CLOSE), obj
+
+
 class IncrementalToolCallParser:
     def __init__(self) -> None:
         self._buffer = ""
@@ -63,28 +80,26 @@ class IncrementalToolCallParser:
         events: list[CliStreamEvent] = []
 
         while True:
-            match = _TOOL_CALL_BLOCK_RE.search(self._buffer)
-            if not match:
+            open_idx = self._buffer.find(_TOOL_CALL_OPEN)
+            if open_idx < 0:
                 break
+            extracted = _try_extract_tool_call(self._buffer, open_idx)
+            if extracted is None:
+                break
+            block_end, obj = extracted
 
-            prefix = self._buffer[: match.start()]
+            prefix = self._buffer[:open_idx]
             if prefix:
                 events.append(CliStreamEvent(kind="text", text=prefix))
 
-            raw = match.group(1)
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                events.append(CliStreamEvent(kind="text", text=match.group(0)))
+            normalized = _normalize_tool_call(obj, self._tool_call_count + 1)
+            if normalized is None:
+                events.append(CliStreamEvent(kind="text", text=self._buffer[open_idx:block_end]))
             else:
-                normalized = _normalize_tool_call(obj, self._tool_call_count + 1)
-                if normalized is None:
-                    events.append(CliStreamEvent(kind="text", text=match.group(0)))
-                else:
-                    self._tool_call_count += 1
-                    events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
+                self._tool_call_count += 1
+                events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
 
-            self._buffer = self._buffer[match.end() :]
+            self._buffer = self._buffer[block_end:]
 
         if final:
             if self._buffer:
@@ -385,17 +400,23 @@ def parse_cli_output(text: str) -> ParsedShimOutput:
     tool_calls: list[dict[str, Any]] = []
     consumed_spans: list[tuple[int, int]] = []
 
-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
-        raw = match.group(1)
-        try:
-            obj = json.loads(raw)
-        except Exception:
+    cursor = 0
+    while cursor < len(text):
+        open_idx = text.find(_TOOL_CALL_OPEN, cursor)
+        if open_idx < 0:
+            break
+        extracted = _try_extract_tool_call(text, open_idx)
+        if extracted is None:
+            cursor = open_idx + len(_TOOL_CALL_OPEN)
             continue
+        block_end, obj = extracted
         normalized = _normalize_tool_call(obj, len(tool_calls) + 1)
         if normalized is None:
+            cursor = block_end
             continue
         tool_calls.append(normalized)
-        consumed_spans.append((match.start(), match.end()))
+        consumed_spans.append((open_idx, block_end))
+        cursor = block_end
 
     if not consumed_spans:
         cleaned, silent = _detect_silent(text.strip(), has_tool_calls=False)
