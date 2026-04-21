@@ -5,8 +5,9 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
+from hermes_shim_http.live_child_pool import LiveChildPool
 from hermes_shim_http.models import CliRunResult, ShimConfig
-from hermes_shim_http.parsing import parse_claude_stream_metadata
+from hermes_shim_http.parsing import parse_claude_stream_json, parse_claude_stream_metadata
 from hermes_shim_http.prompting import build_cli_prompt, build_cli_system_prompt, build_cli_user_prompt
 from hermes_shim_http.runner import _child_lock_path_for_request, _resolve_claude_result_session_id, build_cli_command, run_cli_prompt, stream_cli_prompt
 from hermes_shim_http.session_cache import SessionCache
@@ -976,6 +977,81 @@ class TestRunner:
         assert "".join(texts) == ""
         assert len(tool_calls) == 1
         assert tool_calls[0].tool_call["function"]["name"] == "read_file"
+
+    def test_run_cli_prompt_reuses_live_child_pool_for_multiturn_claude_sessions(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-multiturn"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            heartbeat_wrap=False,
+            cli_profile="claude",
+        )
+        pool = LiveChildPool(size=4, idle_ttl=30.0)
+
+        try:
+            first = run_cli_prompt(
+                "hello",
+                cfg,
+                system_prompt="Be terse.",
+                session_id="sess-a",
+                live_child_pool=pool,
+            )
+            pool_key = next(iter(pool._children.keys()))
+            pid1 = pool.peek_pid(pool_key)
+
+            second = run_cli_prompt(
+                "world",
+                cfg,
+                resume_session_id="sess-a",
+                live_child_pool=pool,
+            )
+            pid2 = pool.peek_pid(pool_key)
+        finally:
+            pool.shutdown()
+
+        assert pid1 is not None and pid1 == pid2
+        assert parse_claude_stream_json(first.stdout).content == "echo:Be terse.\n\nhello"
+        assert parse_claude_stream_json(second.stdout).content == "echo:world"
+
+    def test_stream_cli_prompt_reuses_live_child_pool_for_multiturn_claude_sessions(self):
+        cfg = ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-multiturn"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            heartbeat_wrap=False,
+            cli_profile="claude",
+        )
+        pool = LiveChildPool(size=4, idle_ttl=30.0)
+
+        try:
+            events1 = list(
+                stream_cli_prompt(
+                    "hello",
+                    cfg,
+                    system_prompt="Be terse.",
+                    session_id="sess-a",
+                    live_child_pool=pool,
+                )
+            )
+            pool_key = next(iter(pool._children.keys()))
+            pid1 = pool.peek_pid(pool_key)
+            events2 = list(
+                stream_cli_prompt(
+                    "world",
+                    cfg,
+                    resume_session_id="sess-a",
+                    live_child_pool=pool,
+                )
+            )
+            pid2 = pool.peek_pid(pool_key)
+        finally:
+            pool.shutdown()
+
+        assert pid1 is not None and pid1 == pid2
+        assert "".join(e.text or "" for e in events1 if e.kind == "text") == "echo:Be terse.\n\nhello"
+        assert "".join(e.text or "" for e in events2 if e.kind == "text") == "echo:world"
 
 
 class TestSessionCache:

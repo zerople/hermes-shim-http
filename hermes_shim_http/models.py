@@ -75,3 +75,6 @@ class ShimConfig(BaseModel):
     max_output_bytes: int = Field(default=32 * 1024 * 1024, ge=0)
     single_child_lock_path: Optional[str] = None
     strict_mcp_config: bool = True
+    live_child_pool: bool = False
+    live_child_pool_size: int = Field(default=8, ge=1)
+    live_child_pool_idle_ttl: float = Field(default=300.0, gt=0.0)

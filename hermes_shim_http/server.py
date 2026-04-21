@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from hashlib import sha256
 from typing import Any, Callable, Iterator
 
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 from . import __version__
 from .logging_utils import configure_logger, emit_log
 from .inflight import InFlightRegistry
+from .live_child_pool import LiveChildPool
 from .single_child import ChildLockBusy
 from .models import ChatCompletionsRequest, CliStreamEvent, ParsedShimOutput, ShimConfig, ToolDefinition
 from .parsing import IncrementalToolCallParser
@@ -780,6 +782,7 @@ def _stream_live_chat_chunks(*, app: FastAPI, request_id: str, logger: logging.L
         model=model,
         disable_builtin_tools=True,
         advertised_tools=session_plan.tools,
+        live_child_pool=getattr(app.state, "live_child_pool", None),
     )
     recorded = False
     try:
@@ -888,7 +891,7 @@ def _stream_live_responses_events(*, app: FastAPI, request_id: str, logger: logg
         pending_text_output_index = output_index
         yield _sse_line({"type": "response.output_item.added", "output_index": pending_text_output_index, "item": {"type": "message", "id": pending_text_item_id, "role": "assistant", "status": "in_progress", "content": []}})
 
-    source = stream_cli_prompt(prompt, config, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools)
+    source = stream_cli_prompt(prompt, config, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools, live_child_pool=getattr(app.state, "live_child_pool", None))
     try:
         for event in _iter_events_with_keepalive(source, keepalive_interval=KEEPALIVE_INTERVAL_SECONDS):
             if event is None:
@@ -985,13 +988,28 @@ def _infer_cli_profile(command: str) -> str:
 
 def create_app(config: ShimConfig | None = None) -> FastAPI:
     cfg = config or ShimConfig(command="claude")
-    app = FastAPI(title="Hermes CLI HTTP Shim", version=__version__)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        try:
+            yield
+        finally:
+            pool = getattr(app.state, "live_child_pool", None)
+            if pool is not None:
+                pool.shutdown()
+
+    app = FastAPI(title="Hermes CLI HTTP Shim", version=__version__, lifespan=_lifespan)
     app.state.shim_config = cfg
     app.state.session_cache = SessionCache(path=cfg.cache_path, ttl_seconds=cfg.cache_ttl_seconds, max_entries=cfg.cache_max_entries)
     app.state.started_at = time.time()
     app.state.metrics = {"request_count": 0, "cache_hits": 0, "cache_misses": 0, "total_latency_ms": 0.0, "token_context_total": 0, "token_context_max": 0, "token_response_total": 0, "compactions": 0}
     app.state.pending_compactions = {}
     app.state.in_flight = InFlightRegistry()
+    app.state.live_child_pool = (
+        LiveChildPool(size=cfg.live_child_pool_size, idle_ttl=cfg.live_child_pool_idle_ttl)
+        if cfg.live_child_pool
+        else None
+    )
     logger = configure_logger(log_level=cfg.log_level, log_format=cfg.log_format, logger_name=f"hermes_shim_http.{id(app)}")
 
     @app.exception_handler(ChildLockBusy)
@@ -1204,6 +1222,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
                 model=request.model,
                 disable_builtin_tools=True,
                 advertised_tools=session_plan.tools,
+                live_child_pool=getattr(app.state, "live_child_pool", None),
             )
             parsed = _sanitize_parsed_output(parse_cli_result(result, cfg), allowed_tool_names)
             session_cache.record_success(
@@ -1296,7 +1315,7 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
         emit_log(logger, event="spawn", request_id=request_id, model=model, stream=False)
 
         def _run_responses() -> dict[str, Any]:
-            result = run_cli_prompt(prompt, cfg, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools)
+            result = run_cli_prompt(prompt, cfg, model=model, system_prompt=system_prompt, disable_builtin_tools=True, advertised_tools=normalized_tools, live_child_pool=getattr(app.state, "live_child_pool", None))
             ordered_events = _ordered_cli_events_from_text(result.stdout, allowed_tool_names)
             parsed = _parsed_output_from_events(ordered_events)
             usage = _estimate_usage_for(model, messages=compacted_messages, response_text=parsed.content)
@@ -1359,6 +1378,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Seconds between whitespace heartbeat bytes on non-streaming HTTP responses. 0 disables (default: 30.0).")
     parser.add_argument("--strict-mcp-config", dest="strict_mcp_config", action=argparse.BooleanOptionalAction, default=True,
                         help="For Claude, pass --strict-mcp-config so shim sessions ignore user/project/global MCP configs and only use explicitly provided MCP configs (default: enabled).")
+    parser.add_argument("--live-child-pool", dest="live_child_pool", action=argparse.BooleanOptionalAction, default=False,
+                        help="Keep one long-lived Claude child per conversation in-process and reuse it across turns when possible (default: disabled).")
+    parser.add_argument("--live-child-pool-size", dest="live_child_pool_size", type=int, default=8,
+                        help="Maximum number of live pooled children to keep before LRU eviction (default: 8).")
+    parser.add_argument("--live-child-pool-idle-ttl", dest="live_child_pool_idle_ttl", type=float, default=300.0,
+                        help="Seconds before an idle pooled child is evicted (default: 300.0).")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser
 
@@ -1388,6 +1413,9 @@ def _startup_config_payload(*, host: str, port: int, config: ShimConfig) -> dict
         "http_heartbeat_interval": config.http_heartbeat_interval,
         "single_child_lock_path": config.single_child_lock_path,
         "strict_mcp_config": config.strict_mcp_config,
+        "live_child_pool": config.live_child_pool,
+        "live_child_pool_size": config.live_child_pool_size,
+        "live_child_pool_idle_ttl": config.live_child_pool_idle_ttl,
     }
 
 
@@ -1421,6 +1449,9 @@ def main() -> None:
             else None
         ),
         strict_mcp_config=ns.strict_mcp_config,
+        live_child_pool=ns.live_child_pool,
+        live_child_pool_size=ns.live_child_pool_size,
+        live_child_pool_idle_ttl=ns.live_child_pool_idle_ttl,
     )
     import uvicorn
 

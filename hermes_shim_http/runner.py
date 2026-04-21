@@ -9,8 +9,11 @@ import re
 import subprocess
 import threading
 import time
+from hashlib import sha256
 from typing import Iterator, List
 
+from .hermes_mcp import request_scoped_mcp_config
+from .live_child_pool import LiveChildPool, LiveChildTurnResult
 from .models import CliRunResult, CliStreamEvent, ParsedShimOutput, ShimConfig
 from .parsing import (
     ClaudeStreamJsonParser,
@@ -331,6 +334,73 @@ def _child_lock_path_for_request(
     return f"{base_path}.{_sanitize_lock_key(resume_session_id)}"
 
 
+def _live_child_pool_fingerprint(
+    config: ShimConfig,
+    *,
+    model: str | None,
+    system_prompt: str | None,
+    disable_builtin_tools: bool,
+    mcp_config_path: str | None,
+) -> str:
+    payload = {
+        "command": config.command,
+        "args": _resolved_args(config),
+        "cwd": config.cwd,
+        "model": model or "",
+        "system_prompt": system_prompt or "",
+        "disable_builtin_tools": bool(disable_builtin_tools),
+        "mcp_config_path": mcp_config_path or "",
+        "strict_mcp_config": bool(config.strict_mcp_config),
+        "heartbeat_wrap": bool(config.heartbeat_wrap),
+        "heartbeat_interval": float(config.heartbeat_interval),
+    }
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _live_child_pool_session_key(
+    *,
+    session_id: str | None,
+    resume_session_id: str | None,
+    fingerprint: str,
+) -> str | None:
+    base = (resume_session_id or session_id or "").strip()
+    if not base:
+        return None
+    return f"{base}:{fingerprint}"
+
+
+def _live_child_pool_spawn_command(
+    config: ShimConfig,
+    prompt_text: str,
+    *,
+    session_id: str | None,
+    system_prompt: str | None,
+    model: str | None,
+    disable_builtin_tools: bool,
+    mcp_config_path: str | None,
+) -> list[str]:
+    command = build_cli_command(
+        config,
+        prompt_text,
+        session_id=session_id,
+        resume_session_id=None,
+        system_prompt=system_prompt,
+        model=model,
+        disable_builtin_tools=disable_builtin_tools,
+        mcp_config_path=mcp_config_path,
+    )
+    return _heartbeat_prefix(config) + command
+
+
+def _live_child_pool_prompt_text(
+    prompt_text: str,
+    *,
+    resume_session_id: str | None,
+    system_prompt: str | None,
+) -> str:
+    return prompt_text if resume_session_id else _combine_prompt_text(prompt_text, system_prompt=system_prompt)
+
+
 def run_cli_prompt(
     prompt_text: str,
     config: ShimConfig,
@@ -341,6 +411,7 @@ def run_cli_prompt(
     model: str | None = None,
     disable_builtin_tools: bool = True,
     advertised_tools: list[dict] | None = None,
+    live_child_pool: LiveChildPool | None = None,
 ) -> CliRunResult:
     with request_scoped_mcp_config(tools=advertised_tools if _resolved_profile(config) == "claude" else None) as mcp_config_path:
         stdin_prompt = _stdin_prompt_text(
@@ -362,17 +433,72 @@ def run_cli_prompt(
         stdin_bytes = len(stdin_prompt.encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
         _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
         started = time.time()
-        stdout_text, stderr_text, exit_code = _drain_cli_process(
-            command,
-            config=config,
-            stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
-            lock_path=_child_lock_path_for_request(
+
+        use_live_pool = (
+            live_child_pool is not None
+            and _resolved_profile(config) == "claude"
+            and (session_id or resume_session_id)
+        )
+        pool_result: LiveChildTurnResult | None = None
+        if use_live_pool:
+            fingerprint = _live_child_pool_fingerprint(
                 config,
+                model=model,
+                system_prompt=system_prompt,
+                disable_builtin_tools=disable_builtin_tools,
+                mcp_config_path=mcp_config_path,
+            )
+            pool_key = _live_child_pool_session_key(
                 session_id=session_id,
                 resume_session_id=resume_session_id,
-            ),
-        )
+                fingerprint=fingerprint,
+            )
+            existing_pid = live_child_pool.peek_pid(pool_key or "") if pool_key else None
+            if pool_key and (existing_pid is not None or not resume_session_id):
+                captured: list[LiveChildTurnResult] = []
+                list(
+                    live_child_pool.stream(
+                        pool_key,
+                        _live_child_pool_prompt_text(
+                            prompt_text,
+                            resume_session_id=resume_session_id,
+                            system_prompt=system_prompt,
+                        ),
+                        spawn_command=_live_child_pool_spawn_command(
+                            config,
+                            prompt_text,
+                            session_id=session_id,
+                            system_prompt=system_prompt,
+                            model=model,
+                            disable_builtin_tools=disable_builtin_tools,
+                            mcp_config_path=mcp_config_path,
+                        ),
+                        cwd=config.cwd,
+                        read_timeout=config.timeout,
+                        hard_deadline=config.hard_deadline_seconds,
+                        max_output_bytes=config.max_output_bytes,
+                        on_complete=captured.append,
+                    )
+                )
+                pool_result = captured[0] if captured else LiveChildTurnResult(stdout="", stderr="", session_id=None, is_error=False)
+
+        if pool_result is not None:
+            stdout_text = pool_result.stdout
+            stderr_text = pool_result.stderr
+            exit_code = 1 if pool_result.is_error else 0
+        else:
+            stdout_text, stderr_text, exit_code = _drain_cli_process(
+                command,
+                config=config,
+                stdin_prompt=stdin_prompt if _pipes_prompt_via_stdin(config) else None,
+                lock_path=_child_lock_path_for_request(
+                    config,
+                    session_id=session_id,
+                    resume_session_id=resume_session_id,
+                ),
+            )
     duration_ms = int((time.time() - started) * 1000)
+    metadata = parse_claude_stream_metadata(stdout_text) if _resolved_profile(config) == "claude" else None
     result = CliRunResult(
         stdout=stdout_text,
         stderr=stderr_text,
@@ -381,8 +507,8 @@ def run_cli_prompt(
         session_id=(
             _resolve_claude_result_session_id(
                 requested_resume_session_id=resume_session_id,
-                emitted_session_id=parse_claude_stream_metadata(stdout_text).session_id,
-                failed=exit_code != 0 or parse_claude_stream_metadata(stdout_text).is_error,
+                emitted_session_id=(pool_result.session_id if pool_result is not None else metadata.session_id if metadata else None),
+                failed=exit_code != 0 or (pool_result.is_error if pool_result is not None else bool(metadata and metadata.is_error)),
             )
             if _resolved_profile(config) == "claude"
             else None
@@ -581,7 +707,65 @@ def stream_cli_prompt(
     model: str | None = None,
     disable_builtin_tools: bool = True,
     advertised_tools: list[dict] | None = None,
+    live_child_pool: LiveChildPool | None = None,
 ) -> Iterator[CliStreamEvent]:
+    use_live_pool = (
+        live_child_pool is not None
+        and _resolved_profile(config) == "claude"
+        and (session_id or resume_session_id)
+    )
+    if use_live_pool:
+        with request_scoped_mcp_config(tools=advertised_tools if _resolved_profile(config) == "claude" else None) as mcp_config_path:
+            fingerprint = _live_child_pool_fingerprint(
+                config,
+                model=model,
+                system_prompt=system_prompt,
+                disable_builtin_tools=disable_builtin_tools,
+                mcp_config_path=mcp_config_path,
+            )
+            pool_key = _live_child_pool_session_key(
+                session_id=session_id,
+                resume_session_id=resume_session_id,
+                fingerprint=fingerprint,
+            )
+            existing_pid = live_child_pool.peek_pid(pool_key or "") if pool_key else None
+            if pool_key and (existing_pid is not None or not resume_session_id):
+                command = build_cli_command(
+                    config,
+                    prompt_text,
+                    session_id=session_id,
+                    resume_session_id=resume_session_id,
+                    system_prompt=system_prompt,
+                    model=model,
+                    disable_builtin_tools=disable_builtin_tools,
+                    mcp_config_path=mcp_config_path,
+                )
+                pool_prompt = _live_child_pool_prompt_text(
+                    prompt_text,
+                    resume_session_id=resume_session_id,
+                    system_prompt=system_prompt,
+                )
+                stdin_bytes = len(_build_claude_stdin_payload(pool_prompt).encode("utf-8")) if _pipes_prompt_via_stdin(config) else 0
+                _log_cli_dispatch(command, stdin_bytes=stdin_bytes, session_id=session_id, resume_session_id=resume_session_id)
+                yield from live_child_pool.stream(
+                    pool_key,
+                    pool_prompt,
+                    spawn_command=_live_child_pool_spawn_command(
+                        config,
+                        prompt_text,
+                        session_id=session_id,
+                        system_prompt=system_prompt,
+                        model=model,
+                        disable_builtin_tools=disable_builtin_tools,
+                        mcp_config_path=mcp_config_path,
+                    ),
+                    cwd=config.cwd,
+                    read_timeout=config.timeout,
+                    hard_deadline=config.hard_deadline_seconds,
+                    max_output_bytes=config.max_output_bytes,
+                )
+                return
+
     lock_path = _child_lock_path_for_request(
         config,
         session_id=session_id,
