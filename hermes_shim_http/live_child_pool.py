@@ -21,6 +21,7 @@ from typing import Iterator
 
 from .models import CliStreamEvent
 from .parsing import ClaudeStreamJsonParser
+from .single_child import ChildLockBusy
 
 
 @dataclass(slots=True)
@@ -96,7 +97,9 @@ class _LiveChild:
     ) -> Iterator[CliStreamEvent]:
         if self._process.stdin is None:
             raise RuntimeError("LiveChild: stdin pipe unavailable")
-        with self._turn_lock:
+        if not self._turn_lock.acquire(blocking=False):
+            raise ChildLockBusy(f"live child turn already in progress for pid {self.pid}")
+        try:
             self._process.stdin.write(self._build_payload(prompt))
             self._process.stdin.flush()
 
@@ -167,6 +170,8 @@ class _LiveChild:
                         is_error=metadata.is_error,
                     )
                 )
+        finally:
+            self._turn_lock.release()
 
     def terminate(self) -> None:
         if self._process.poll() is not None:
@@ -221,6 +226,7 @@ class LiveChildPool:
         max_output_bytes: int | None = None,
         on_complete=None,
     ) -> Iterator[CliStreamEvent]:
+        self.sweep()
         child = self._acquire(session_key, spawn_command=spawn_command, cwd=cwd)
         try:
             yield from child.send_and_stream(
@@ -248,6 +254,18 @@ class LiveChildPool:
             stale = [key for key, child in self._children.items() if now - child.last_used > self._idle_ttl]
             victims = [self._children.pop(key) for key in stale]
         for victim in victims:
+            victim.terminate()
+
+    def rekey(self, old_session_key: str, new_session_key: str) -> None:
+        if not old_session_key or not new_session_key or old_session_key == new_session_key:
+            return
+        with self._lock:
+            child = self._children.pop(old_session_key, None)
+            if child is None:
+                return
+            victim = self._children.pop(new_session_key, None)
+            self._children[new_session_key] = child
+        if victim is not None:
             victim.terminate()
 
     def shutdown(self) -> None:

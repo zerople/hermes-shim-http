@@ -1252,6 +1252,13 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             )
         try:
             return JSONResponse(content=_run_chat(), headers=headers)
+        except ChildLockBusy as exc:
+            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": str(exc), "type": "child_lock_busy", "code": "child_lock_busy"}},
+                headers={**headers, "Retry-After": "5"},
+            )
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1340,6 +1347,13 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             )
         try:
             return JSONResponse(content=_run_responses(), headers=headers)
+        except ChildLockBusy as exc:
+            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": str(exc), "type": "child_lock_busy", "code": "child_lock_busy"}},
+                headers={**headers, "Retry-After": "5"},
+            )
         except Exception as exc:
             emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
             raise HTTPException(status_code=500, detail=str(exc)) from exc

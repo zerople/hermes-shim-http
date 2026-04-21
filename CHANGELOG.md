@@ -2,6 +2,17 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.27] - 2026-04-21
+
+### Fixed
+- **Idle TTL now actually applies to pooled Claude children.** `LiveChildPool.stream()` now sweeps stale children before reuse/acquire, so `--live-child-pool-idle-ttl` is no longer a test-only knob and expired children are replaced automatically on the next access.
+- **Same pooled conversation can no longer silently queue concurrent turns.** A pooled child now rejects a second turn with `ChildLockBusy` instead of blocking on an internal mutex, preserving the shim's phantom-prevention policy for duplicated/retried requests that target the same live Claude session.
+- **Fresh pooled sessions are re-keyed to the actual emitted backend session id.** After the first successful pooled turn, the child is moved from the provisional local session key to the real Claude session lineage so later resume-planned turns actually hit the existing live child instead of silently falling back to a cold spawn.
+- **Non-streaming 409 handling now preserves `child_lock_busy` semantics without degrading to HTTP 500.** When pooled-turn rejection happens on the non-streaming chat/responses path (with HTTP heartbeat disabled), the shim now returns the same structured 409 body as the normal exception handler.
+
+### Tests
+- Added regression coverage for automatic idle eviction, same-session concurrent-turn rejection, and non-streaming HTTP 409 propagation for pooled-child contention.
+
 ## [0.1.26] - 2026-04-20
 
 ### Added

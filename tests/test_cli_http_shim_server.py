@@ -83,8 +83,50 @@ def test_chat_completions_reuses_live_child_pool_when_enabled():
     assert pid1 is not None and pid1 == pid2
 
 
+def test_chat_completions_rejects_concurrent_live_child_turns():
+    app = create_app(
+        ShimConfig(
+            command="python3",
+            args=[str(FAKE_CLI), "--mode", "claude-multiturn"],
+            cwd=str(REPO_ROOT),
+            timeout=12.0,
+            http_heartbeat_interval=0,
+            cli_profile="claude",
+            models=["claude-cli"],
+            heartbeat_wrap=False,
+            live_child_pool=True,
+        )
+    )
+
+    with TestClient(app) as client:
+        seed = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        assert seed.status_code == 200
+        first_text = seed.json()["choices"][0]["message"]["content"]
+
+        from hermes_shim_http.single_child import ChildLockBusy
+
+        with patch.object(app.state.live_child_pool, "stream", side_effect=ChildLockBusy("live child turn already in progress")):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-cli",
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": first_text},
+                        {"role": "user", "content": "second"},
+                    ],
+                },
+            )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "child_lock_busy"
+
 
 def test_models_endpoint_returns_configured_models():
+
     client = _client()
 
     response = client.get("/v1/models")

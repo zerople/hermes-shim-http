@@ -82,14 +82,11 @@ def test_idle_child_is_evicted_after_idle_ttl(pool_factory):
     assert pid1 is not None
 
     time.sleep(0.4)
-    pool.sweep()
-
-    assert pool.peek_pid("sess-a") is None, "idle child should have been evicted"
 
     list(pool.stream("sess-a", "second"))
     pid2 = pool.peek_pid("sess-a")
     assert pid2 is not None
-    assert pid2 != pid1, "a fresh child should be spawned after eviction"
+    assert pid2 != pid1, "a fresh child should be spawned after idle TTL expiry without requiring manual sweep()"
 
 
 def test_lru_eviction_when_pool_exceeds_size(pool_factory):
@@ -127,3 +124,29 @@ def test_shutdown_kills_all_live_children(pool_factory):
             time.sleep(0.05)
         else:
             pytest.fail(f"child pid {pid} did not exit after shutdown")
+
+
+def test_same_session_key_rejects_concurrent_turns(pool_factory):
+    import threading
+
+    pool = pool_factory()
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def _first_turn() -> None:
+        try:
+            started.set()
+            list(pool.stream("sess-a", "sleep:0.6 first"))
+        except BaseException as exc:  # pragma: no cover - test helper
+            errors.append(exc)
+
+    thread = threading.Thread(target=_first_turn)
+    thread.start()
+    assert started.wait(timeout=1.0)
+    time.sleep(0.1)
+
+    with pytest.raises(RuntimeError, match="turn already in progress"):
+        list(pool.stream("sess-a", "second"))
+
+    thread.join(timeout=2.0)
+    assert not errors
