@@ -2,6 +2,19 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.29] - 2026-04-21
+
+### Fixed
+- **Tool-call parser no longer truncates blocks whose JSON arguments contain a literal </tool_call> substring.** Previously `hermes_shim_http.parsing` extracted the JSON body of a <tool_call>...</tool_call> block with the non-greedy regex `<tool_call>\s*(\{.*?\})\s*</tool_call>`. When the emitted `arguments` JSON string contained the literal substring </tool_call> (for example, when a `patch` or `write_file` tool call targets documentation that itself describes the shim’s tool-call protocol), the regex terminated at the inner close tag and produced a truncated JSON fragment that failed `json.loads`, so the whole block fell through as raw assistant text and leaked into downstream chat surfaces instead of executing. The regex is replaced with a `json.JSONDecoder.raw_decode`-based extractor (`_try_extract_tool_call`) that parses exactly one JSON value starting at the opener and then requires the close tag to follow, so string-escaped occurrences of <tool_call> / </tool_call> inside `arguments` no longer terminate the block early. Both `IncrementalToolCallParser._drain` (streaming path) and `parse_cli_output` (batch path) are updated to use the new extractor; the now-unused `_TOOL_CALL_BLOCK_RE` and its `import re` are removed.
+
+### Tests
+- Added regression coverage in `tests/test_cli_http_shim_parsing.py` for both `parse_cli_output` and `IncrementalToolCallParser` handling a tool-call whose `arguments` JSON string embeds a literal <tool_call>{...}</tool_call> sequence.
+
+## [0.1.28] - 2026-04-21
+
+### Changed
+- **Transcript turns are now wrapped in `----- turn:ROLE -----` / `----- end -----` markers instead of `<role>...</role>` tags.** The previous `<system>`, `<user>`, `<assistant>`, `<tool>` wrappers shared the same angle-bracket grammar as the shim’s <tool_call>{...}</tool_call> protocol, so a reasoning backend (or a nested tool result echoing the rendered transcript) could emit a role tag that the downstream parser would confuse with a live turn boundary. Rendering turns with `----- turn:ROLE -----` / `----- end -----` moves transcript context out of the tool-call grammar entirely so the two surfaces cannot collide. `build_cli_system_prompt` now tells the CLI explicitly that those markers are transcript-only and must never be emitted by the model. `_render_transcript` in `hermes_shim_http/prompting.py` and the covering tests in `tests/test_cli_http_shim.py` / `tests/test_cli_http_shim_server.py` are updated accordingly.
+
 ## [0.1.27] - 2026-04-21
 
 ### Fixed
@@ -36,11 +49,6 @@ All notable changes to `@zerople/hermes-shim-http` will be documented in this fi
 - **Hermes MCP-prefixed tool names are normalized back into canonical Hermes tool calls.** When Claude selects a shim-owned MCP tool like `mcp__hermes__read_file`, the shim now remaps it back to `read_file` before allowlist enforcement and response shaping, so the upstream Hermes execution path stays identical to the non-MCP tool-call shape.
 
 ## [0.1.24] - 2026-04-19
-
-### Fixed
-- **HTTP 400 `out of extra usage` regression when Hermes runs on an OAuth Pro/Max plan.** 0.1.23 moved the Hermes tool catalog from the stdin user message into the `--append-system-prompt` flag value (merged with the short turn-discipline preface). With Hermes-scale payloads the catalog is ~22 KB, which alone pushes Anthropic's OAuth billing classifier to route the request to the extra-usage bucket instead of the plan-included bucket — even when the account has no extra-usage credit — and the CLI then fails with `400 ... out of extra usage`. Isolated end-to-end with a real captured request (V1–V5 replay matrix against the live API): big `--append-system-prompt` alone triggers the 400 regardless of stdin size or `--tools ""`. 0.1.24 reverts the catalog back into the stdin user message (0.1.22's channel), so `--append-system-prompt` once again carries only the ~281-byte turn-discipline preface and stays in the plan-included bucket. The `--tools ""` enforcement from 0.1.23 is preserved (it is independently confirmed to be billing-neutral), so Hermes tools still structurally win over Claude built-ins. `build_cli_command` no longer merges the caller-supplied `system_prompt` into the flag value; `_stdin_prompt_text` now prepends it to the Claude stream-json user-message text on new sessions (resumes keep the existing `system_prompt`-off-stdin invariant). Tests in `tests/test_cli_http_shim.py` updated accordingly.
-
-## [0.1.23] - 2026-04-19
 
 ### Fixed
 - **HTTP 400 `out of extra usage` regression when Hermes runs on an OAuth Pro/Max plan.** 0.1.23 moved the Hermes tool catalog from the stdin user message into the `--append-system-prompt` flag value (merged with the short turn-discipline preface). With Hermes-scale payloads the catalog is ~22 KB, which alone pushes Anthropic's OAuth billing classifier to route the request to the extra-usage bucket instead of the plan-included bucket — even when the account has no extra-usage credit — and the CLI then fails with `400 ... out of extra usage`. Isolated end-to-end with a real captured request (V1–V5 replay matrix against the live API): big `--append-system-prompt` alone triggers the 400 regardless of stdin size or `--tools ""`. 0.1.24 reverts the catalog back into the stdin user message (0.1.22's channel), so `--append-system-prompt` once again carries only the ~281-byte turn-discipline preface and stays in the plan-included bucket. The `--tools ""` enforcement from 0.1.23 is preserved (it is independently confirmed to be billing-neutral), so Hermes tools still structurally win over Claude built-ins. `build_cli_command` no longer merges the caller-supplied `system_prompt` into the flag value; `_stdin_prompt_text` now prepends it to the Claude stream-json user-message text on new sessions (resumes keep the existing `system_prompt`-off-stdin invariant). Tests in `tests/test_cli_http_shim.py` updated accordingly.
