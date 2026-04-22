@@ -4,6 +4,14 @@ All notable changes to `@zerople/hermes-shim-http` will be documented in this fi
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-04-22
+
+### Fixed
+- **Backend failures now preserve HTTP error status in non-streaming mode even when HTTP heartbeat is configured.** `/v1/chat/completions` and `/v1/responses` no longer route non-streaming responses through the heartbeat streaming wrapper that pre-committed `200 OK`; backend exceptions now propagate through normal JSONResponse/HTTPException handling as `500`.
+
+### Tests
+- Added server regression tests to assert `500` propagation for backend failures with `http_heartbeat_interval > 0` on both Chat Completions and Responses endpoints.
+
 ## [0.1.31] - 2026-04-22
 
 ### Changed
