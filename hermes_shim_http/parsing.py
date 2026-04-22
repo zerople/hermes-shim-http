@@ -109,7 +109,32 @@ def _malformed_notice(name: str, reason: str) -> str:
     return _MALFORMED_NOTICE.format(name=name, reason=reason)
 
 
+def _tool_call_inner_payload(raw_block: str) -> str:
+    open_end = raw_block.find(">")
+    close_start = raw_block.rfind(_TOOL_CALL_CLOSE)
+    if open_end < 0 or close_start < 0 or close_start <= open_end:
+        return raw_block.strip()
+    return raw_block[open_end + 1 : close_start].strip()
+
+
+def _should_suppress_malformed_telemetry(raw_block: str) -> bool:
+    """Best-effort filter for obvious prompt-echo placeholders.
+
+    We still reject execution, but avoid noisy malformed telemetry/raw-log churn
+    for clearly non-protocol examples like `<tool_call ...>{...}</tool_call>`.
+    """
+    payload = _tool_call_inner_payload(raw_block)
+    compact = "".join(payload.split())
+    if compact in {"{...}", "{…}"}:
+        return True
+    if "..." in compact and all(key not in compact for key in ('"function"', '"name"', '"id"', '"type"')):
+        return True
+    return False
+
+
 def _emit_malformed_event(*, raw_block: str, reason: str) -> str:
+    if _should_suppress_malformed_telemetry(raw_block):
+        return ""
     name = _best_effort_tool_name(raw_block)
     raw_file = _dump_malformed_raw_block(raw_block)
     emit_event(
@@ -237,7 +262,8 @@ class IncrementalToolCallParser:
                         raw_block=self._buffer[open_idx:block_end],
                         reason="normalize_rejected",
                     )
-                    events.append(CliStreamEvent(kind="text", text=notice))
+                    if notice:
+                        events.append(CliStreamEvent(kind="text", text=notice))
                 else:
                     self._tool_call_count += 1
                     events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
@@ -262,13 +288,16 @@ class IncrementalToolCallParser:
                     self._tool_call_count += 1
                     events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
                     notice = _emit_malformed_event(raw_block=raw_block, reason="repaired_from_malformed")
-                    events.append(CliStreamEvent(kind="text", text=notice))
+                    if notice:
+                        events.append(CliStreamEvent(kind="text", text=notice))
                 else:
                     notice = _emit_malformed_event(raw_block=raw_block, reason="normalize_rejected")
-                    events.append(CliStreamEvent(kind="text", text=notice))
+                    if notice:
+                        events.append(CliStreamEvent(kind="text", text=notice))
             else:
                 notice = _emit_malformed_event(raw_block=raw_block, reason="json_decode_error")
-                events.append(CliStreamEvent(kind="text", text=notice))
+                if notice:
+                    events.append(CliStreamEvent(kind="text", text=notice))
 
             self._buffer = self._buffer[malformed_end:]
 
@@ -587,7 +616,8 @@ def parse_cli_output(text: str, *, expected_tool_call_nonce: str | None = None) 
             normalized = _normalize_tool_call(obj, len(tool_calls) + 1)
             if normalized is None:
                 notice = _emit_malformed_event(raw_block=text[open_idx:block_end], reason="normalize_rejected")
-                parts.append(notice)
+                if notice:
+                    parts.append(notice)
             else:
                 tool_calls.append(normalized)
             cursor = block_end
@@ -605,11 +635,17 @@ def parse_cli_output(text: str, *, expected_tool_call_nonce: str | None = None) 
             normalized = _normalize_tool_call(repaired, len(tool_calls) + 1)
             if normalized is not None:
                 tool_calls.append(normalized)
-                parts.append(_emit_malformed_event(raw_block=raw_block, reason="repaired_from_malformed"))
+                notice = _emit_malformed_event(raw_block=raw_block, reason="repaired_from_malformed")
+                if notice:
+                    parts.append(notice)
             else:
-                parts.append(_emit_malformed_event(raw_block=raw_block, reason="normalize_rejected"))
+                notice = _emit_malformed_event(raw_block=raw_block, reason="normalize_rejected")
+                if notice:
+                    parts.append(notice)
         else:
-            parts.append(_emit_malformed_event(raw_block=raw_block, reason="json_decode_error"))
+            notice = _emit_malformed_event(raw_block=raw_block, reason="json_decode_error")
+            if notice:
+                parts.append(notice)
 
         cursor = malformed_end
 

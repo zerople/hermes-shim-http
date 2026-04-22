@@ -57,6 +57,24 @@ def test_parse_tool_call_requires_matching_nonce_when_configured():
     assert '<tool_call nonce="wrong">' in rejected.content
 
 
+def test_parse_tool_call_placeholder_echo_is_ignored_without_malformed_notice(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _capture(event: str, **fields):
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("hermes_shim_http.parsing.emit_event", _capture)
+    parsed = parse_cli_output(
+        '<tool_call nonce="nonce-123">{...}</tool_call>',
+        expected_tool_call_nonce="nonce-123",
+    )
+
+    assert parsed.tool_calls == []
+    assert parsed.content == ""
+    assert captured == {}
+
+
 def test_parse_multiple_tool_call_blocks_and_visible_text_cleanup():
     parsed = parse_cli_output(
         "Need two actions.\n"
@@ -135,6 +153,22 @@ def test_emit_malformed_event_redacts_raw_preview(monkeypatch):
     assert captured["raw_size"] == len('{"name":"read_file","arguments":"secret"}')
     assert isinstance(captured["raw_sha256"], str)
     assert len(str(captured["raw_sha256"])) == 64
+
+
+def test_emit_malformed_event_suppresses_prompt_echo_placeholder(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _capture(event: str, **fields):
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setenv("HERMES_SHIM_CLAUDE_RAW_LOG_DIR", "")
+    monkeypatch.setattr("hermes_shim_http.parsing.emit_event", _capture)
+
+    notice = _emit_malformed_event(raw_block='<tool_call nonce="nonce-123">{...}</tool_call>', reason="json_decode_error")
+
+    assert notice == ""
+    assert captured == {}
 
 
 def test_bare_tool_call_json_without_wrapper_remains_plain_text():
@@ -227,6 +261,23 @@ def test_incremental_parser_requires_matching_nonce_when_configured():
     assert len(tool_calls) == 1
     assert tool_calls[0]["id"] == "call_1"
     assert '<tool_call nonce="wrong">' in text
+
+
+def test_incremental_parser_suppresses_notice_for_placeholder_echo(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _capture(event: str, **fields):
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("hermes_shim_http.parsing.emit_event", _capture)
+    parser = IncrementalToolCallParser(expected_tool_call_nonce="nonce-123")
+
+    events = parser.feed('<tool_call nonce="nonce-123">{...}</tool_call>') + parser.finalize()
+
+    assert [event.tool_call for event in events if event.tool_call] == []
+    assert "".join(event.text or "" for event in events if event.kind == "text") == ""
+    assert captured == {}
 
 
 def _stream_json(*events: dict) -> str:
