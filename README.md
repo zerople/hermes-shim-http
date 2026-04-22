@@ -180,16 +180,15 @@ Debug / parsing observability env vars:
 
 ---
 
-## What's new in 0.1.30
+## What's new in 0.1.31
 
-`0.1.30` focused on tool-call protocol hardening and safer observability:
+`0.1.31` is a release-hygiene + documentation alignment cut:
 
-- request-scoped tool-call nonce enforcement across chat/responses paths
-- prompt rendering hardening so literal transcript markers / `<tool_call>` text inside content do not collide with protocol parsing
-- malformed tool-call containment with structured notice behavior (plus optional `json_repair` gate)
-- default-on raw log capture with rotation caps to avoid unbounded growth
+- npm publish workflow is now trusted-publishing only (`npm publish --provenance --access public` with GitHub OIDC)
+- maintainer release docs and roadmap were refreshed to match current behavior
+- README operator guidance/CLI options were cleaned up to remove stale `0.1.7` references
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for details.
+For runtime protocol hardening changes, see `0.1.30` in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ---
 

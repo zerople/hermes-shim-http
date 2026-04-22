@@ -4,6 +4,8 @@ All notable changes to `@zerople/hermes-shim-http` will be documented in this fi
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-04-22
+
 ### Changed
 - **Publish workflow now uses npm trusted publishing only.** `.github/workflows/publish-npm.yml` now publishes with `npm publish --provenance --access public` under GitHub OIDC (`id-token: write`) and no longer depends on `NPM_TOKEN`.
 - **Maintainer and roadmap docs were realigned to current state (`v0.1.30`).** Updated release guidance and roadmap milestones so docs match actual runtime/packaging behavior.
