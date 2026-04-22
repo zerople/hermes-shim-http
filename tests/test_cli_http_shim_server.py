@@ -1406,3 +1406,35 @@ def test_empty_response_without_sentinel_is_not_marked_silent():
     payload = response.json()
     assert "silent" not in payload["choices"][0]
     assert payload["choices"][0]["message"]["content"] == ""
+
+
+def test_chat_completions_returns_500_on_backend_failure_even_when_http_heartbeat_enabled():
+    client = _client_with_config(http_heartbeat_interval=30)
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        side_effect=RuntimeError("CLI process failed: backend unavailable"),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-cli", "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+    assert response.status_code == 500
+    assert "CLI process failed" in response.json()["detail"]
+
+
+def test_responses_returns_500_on_backend_failure_even_when_http_heartbeat_enabled():
+    client = _client_with_config(http_heartbeat_interval=30)
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        side_effect=RuntimeError("CLI process failed: backend unavailable"),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "claude-cli", "input": "hello"},
+        )
+
+    assert response.status_code == 500
+    assert "CLI process failed" in response.json()["detail"]

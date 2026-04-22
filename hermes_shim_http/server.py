@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -39,50 +39,10 @@ SILENT_HEADER = "X-Shim-Silent"
 
 KEEPALIVE_INTERVAL_SECONDS = 10.0
 
-_HTTP_HEARTBEAT_BYTE = b" "
 
 
 def _new_tool_call_nonce() -> str:
     return secrets.token_hex(8)
-
-
-def _streaming_json_with_heartbeat(
-    run_fn: Callable[[], dict[str, Any]],
-    *,
-    interval: float,
-    on_error: Callable[[BaseException], dict[str, Any]],
-) -> Iterator[bytes]:
-    """Run ``run_fn`` on a background thread, emit whitespace every ``interval``s
-    while it runs, then yield the final JSON body.
-
-    JSON (RFC 8259) allows arbitrary leading whitespace, so callers parsing the
-    concatenated stream as JSON still get a valid document. The heartbeat bytes
-    keep Hermes→shim HTTP connections alive through long CLI runs.
-
-    If ``run_fn`` raises, ``on_error`` builds an OpenAI-style error body. The
-    HTTP status is 200 (already committed before we knew the outcome); callers
-    must inspect the ``error`` field.
-    """
-    outcome: dict[str, Any] = {}
-    done = threading.Event()
-
-    def _worker() -> None:
-        try:
-            outcome["body"] = run_fn()
-        except BaseException as exc:  # noqa: BLE001 — surface via JSON body
-            outcome["error"] = exc
-        finally:
-            done.set()
-
-    threading.Thread(target=_worker, daemon=True).start()
-    while not done.wait(interval):
-        yield _HTTP_HEARTBEAT_BYTE
-
-    if "error" in outcome:
-        body = on_error(outcome["error"])
-    else:
-        body = outcome["body"]
-    yield json.dumps(body).encode("utf-8")
 
 
 def _is_silent_candidate(accumulated: str, sentinel: str) -> bool:
@@ -1299,17 +1259,6 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             headers = _silent_headers(parsed, headers)
             return _chat_response(model=request.model, parsed=parsed, usage=usage)
 
-        def _on_chat_error(exc: BaseException) -> dict[str, Any]:
-            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=request.model)
-            return {"error": {"message": str(exc), "type": "shim_error"}}
-
-        if cfg.http_heartbeat_interval > 0:
-            heartbeat_stream = _streaming_json_with_heartbeat(_run_chat, interval=cfg.http_heartbeat_interval, on_error=_on_chat_error)
-            return StreamingResponse(
-                _release_on_exit(heartbeat_stream, app.state.in_flight, idempotency_key),
-                media_type="application/json",
-                headers=headers,
-            )
         try:
             return JSONResponse(content=_run_chat(), headers=headers)
         except ChildLockBusy as exc:
@@ -1417,17 +1366,6 @@ def create_app(config: ShimConfig | None = None) -> FastAPI:
             headers = _silent_headers(parsed, headers)
             return _responses_json_response(model=model, parsed=parsed, usage=usage, output_items=_responses_output_items_from_events(ordered_events))
 
-        def _on_responses_error(exc: BaseException) -> dict[str, Any]:
-            emit_log(logger, event="error", request_id=request_id, error=str(exc), model=model)
-            return {"error": {"message": str(exc), "type": "shim_error"}}
-
-        if cfg.http_heartbeat_interval > 0:
-            heartbeat_stream = _streaming_json_with_heartbeat(_run_responses, interval=cfg.http_heartbeat_interval, on_error=_on_responses_error)
-            return StreamingResponse(
-                _release_on_exit(heartbeat_stream, app.state.in_flight, idempotency_key),
-                media_type="application/json",
-                headers=headers,
-            )
         try:
             return JSONResponse(content=_run_responses(), headers=headers)
         except ChildLockBusy as exc:
