@@ -725,7 +725,7 @@ def _normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
                     "arguments": str(item.get("arguments") or "{}"),
                 },
             }
-            messages.append({"role": "assistant", "content": f"<tool_call>{json.dumps(tool_call, ensure_ascii=False)}</tool_call>"})
+            messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
             continue
         if item_type == "function_call_output":
             messages.append({"role": "tool", "tool_call_id": str(item.get("call_id") or "").strip() or None, "content": str(item.get("output") or "")})
@@ -744,7 +744,21 @@ def _normalize_responses_input(raw_input: Any) -> list[dict[str, Any]]:
             content = "\n".join(parts)
         elif not isinstance(content, str):
             content = str(content)
-        messages.append({"role": role, "content": content})
+        message: dict[str, Any] = {"role": role, "content": content}
+        if role == "assistant":
+            raw_tool_calls = item.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                normalized_tool_calls = [tool_call for tool_call in raw_tool_calls if isinstance(tool_call, dict)]
+                if normalized_tool_calls:
+                    message["tool_calls"] = normalized_tool_calls
+        if role == "tool":
+            tool_call_id = str(item.get("tool_call_id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            if name:
+                message["name"] = name
+        messages.append(message)
     return messages
 
 

@@ -1,10 +1,13 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from hermes_shim_http.parsing import (
     ClaudeStreamJsonParser,
     IncrementalToolCallParser,
+    _dump_malformed_raw_block,
+    _emit_malformed_event,
     parse_claude_stream_json,
     parse_cli_output,
 )
@@ -98,6 +101,40 @@ def test_malformed_tool_call_can_be_repaired_when_enabled(monkeypatch):
     assert len(parsed.tool_calls) == 1
     assert parsed.tool_calls[0]["function"]["name"] == "read_file"
     assert "reason=repaired_from_malformed" in parsed.content
+
+
+def test_dump_malformed_raw_block_uses_unique_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SHIM_CLAUDE_RAW_LOG_DIR", str(tmp_path))
+
+    first = _dump_malformed_raw_block("first")
+    second = _dump_malformed_raw_block("second")
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+    assert Path(first).read_text(encoding="utf-8") == "first"
+    assert Path(second).read_text(encoding="utf-8") == "second"
+
+
+def test_emit_malformed_event_redacts_raw_preview(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _capture(event: str, **fields):
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setenv("HERMES_SHIM_CLAUDE_RAW_LOG_DIR", "")
+    monkeypatch.setattr("hermes_shim_http.parsing.emit_event", _capture)
+
+    notice = _emit_malformed_event(raw_block='{"name":"read_file","arguments":"secret"}', reason="json_decode_error")
+
+    assert "dropped malformed tool_call" in notice
+    assert captured["event"] == "tool_call_malformed"
+    assert captured["reason"] == "json_decode_error"
+    assert "raw_preview" not in captured
+    assert captured["raw_size"] == len('{"name":"read_file","arguments":"secret"}')
+    assert isinstance(captured["raw_sha256"], str)
+    assert len(str(captured["raw_sha256"])) == 64
 
 
 def test_bare_tool_call_json_without_wrapper_remains_plain_text():

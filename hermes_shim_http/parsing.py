@@ -4,7 +4,9 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 
 from .models import CliStreamEvent, ParsedShimOutput
@@ -19,6 +21,8 @@ _MALFORMED_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 _JSON_REPAIR_ENV = "HERMES_SHIM_JSON_REPAIR_ENABLED"
 _RAW_LOG_ENV = "HERMES_SHIM_CLAUDE_RAW_LOG_DIR"
 _DEFAULT_RAW_LOG_DIR = os.path.expanduser("~/.hermes/hermes-shim-http/raw-logs")
+_RAW_LOG_MAX_FILES = 200
+_RAW_LOG_MAX_BYTES = 500 * 1024 * 1024
 
 _CLAUDE_IGNORED_DELTA_TYPES = frozenset({"thinking_delta", "signature_delta"})
 
@@ -43,14 +47,49 @@ def _resolved_raw_log_dir() -> str | None:
     return os.path.expanduser(value)
 
 
+def _rotate_raw_logs(log_dir: str) -> None:
+    try:
+        entries: list[tuple[float, int, str]] = []
+        for name in os.listdir(log_dir):
+            path = os.path.join(log_dir, name)
+            if not os.path.isfile(path):
+                continue
+            stat = os.stat(path)
+            entries.append((stat.st_mtime, stat.st_size, path))
+        entries.sort(key=lambda item: item[0], reverse=True)
+
+        keep: list[tuple[float, int, str]] = []
+        total = 0
+        for item in entries:
+            if len(keep) >= _RAW_LOG_MAX_FILES:
+                continue
+            if total + item[1] > _RAW_LOG_MAX_BYTES:
+                continue
+            keep.append(item)
+            total += item[1]
+
+        keep_paths = {path for _, _, path in keep}
+        for _, _, path in entries:
+            if path in keep_paths:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        return
+
+
 def _dump_malformed_raw_block(raw_block: str) -> str | None:
     log_dir = _resolved_raw_log_dir()
     if not log_dir:
         return None
     try:
         os.makedirs(log_dir, exist_ok=True)
+        _rotate_raw_logs(log_dir)
         ts = time.strftime("%Y%m%d-%H%M%S")
-        filename = f"malformed-tool-call-{ts}-{os.getpid()}.log"
+        unique = uuid.uuid4().hex[:8]
+        filename = f"malformed-tool-call-{ts}-{os.getpid()}-{unique}.log"
         path = os.path.join(log_dir, filename)
         with open(path, "w", encoding="utf-8") as fp:
             fp.write(raw_block)
@@ -77,7 +116,8 @@ def _emit_malformed_event(*, raw_block: str, reason: str) -> str:
         "tool_call_malformed",
         name=name,
         reason=reason,
-        raw_preview=raw_block[:200],
+        raw_size=len(raw_block),
+        raw_sha256=sha256(raw_block.encode("utf-8", errors="ignore")).hexdigest(),
         full_raw_file=raw_file,
     )
     return _malformed_notice(name, reason)

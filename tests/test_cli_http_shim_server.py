@@ -808,6 +808,38 @@ def test_responses_endpoint_returns_function_call_items():
     assert payload["output"][0]["call_id"] == "call_1"
 
 
+def test_responses_endpoint_renders_input_function_call_as_structured_tool_call_in_prompt():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="done", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "sonnet",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_prev",
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                    {"type": "function_call_output", "call_id": "call_prev", "output": "README body"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    sent_prompt = mock_run.call_args.args[0]
+    assert '<tool_call nonce="nonce-test">' in sent_prompt
+    assert '"id": "call_prev"' in sent_prompt
+    assert '"name": "read_file"' in sent_prompt
+    assert '<\u200btool_call' not in sent_prompt
+
+
 def test_responses_endpoint_rejects_unadvertised_tool_calls():
     client = _client()
 

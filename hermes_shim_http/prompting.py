@@ -90,11 +90,12 @@ _TURN_CLOSE = "----- end -----"
 _ZWSP = "\u200b"
 
 
-def _escape_rendered_content_literals(text: str) -> str:
+def _escape_rendered_content_literals(text: str, *, escape_tool_call_tags: bool = True) -> str:
     if not text:
         return text
-    escaped = text.replace("----- turn:", f"----- turn{_ZWSP}:").replace("----- end -----", f"-----{_ZWSP} end -----")
-    escaped = escaped.replace("<tool_call", f"<{_ZWSP}tool_call").replace("</tool_call>", f"</{_ZWSP}tool_call>")
+    escaped = _escape_transcript_markers(text)
+    if escape_tool_call_tags:
+        escaped = escaped.replace("<tool_call", f"<{_ZWSP}tool_call").replace("</tool_call>", f"</{_ZWSP}tool_call>")
     return escaped
 
 
