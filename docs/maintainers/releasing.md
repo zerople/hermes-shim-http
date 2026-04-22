@@ -22,11 +22,8 @@ Before the first public release, configure:
 1. npm package ownership for the `@zerople` scope
 2. npm trusted publishing for this GitHub repository
    - add the GitHub repo/workflow as a trusted publisher in npm
-   - this is the recommended path because it avoids long-lived publish tokens
-3. optional fallback only if you cannot use trusted publishing:
-   - GitHub Actions secret `NPM_TOKEN`
-   - use an npm automation token or a granular token with bypass 2FA enabled
-4. recommended repository settings:
+   - publish workflow expects OIDC (`id-token: write`) + `npm publish --provenance`
+3. recommended repository settings:
    - protect `main`
    - restrict who can create release tags if needed
 
@@ -50,8 +47,8 @@ Update these together for every release:
 - `pyproject.toml`
 - `hermes_shim_http/__init__.py`
 - `CHANGELOG.md`
-- `docs/releases/vX.Y.Z.md`
 - tests that assert the version string
+- optional per-release notes (if maintained), e.g. `docs/releases/vX.Y.Z.md`
 
 The publish workflow also validates that these versions match, and if the workflow was triggered by a tag push, it verifies the tag version matches the package version.
 

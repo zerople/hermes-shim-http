@@ -1,61 +1,52 @@
 # hermes-shim-http Roadmap
 
-> Last updated: 2026-04-17 for `v0.1.7`
+> Last updated: 2026-04-22 for `v0.1.30`
 
-## Current State: v0.1.7
+## Current State: v0.1.30
 
-`hermes-shim-http` is now a usable Claude-first OpenAI-compatible local shim with:
+`hermes-shim-http` is an OpenAI-compatible local HTTP shim for Claude/Codex/OpenCode with:
 
-- `chat/completions` and `responses` compatibility endpoints
-- npm launcher + Python runtime bootstrap
-- startup preflight (`--doctor`) and startup config visibility
-- Claude stdin transport to avoid argv limits
-- short bootstrap `--append-system-prompt` only on fresh Claude sessions
-- Claude session reuse via prefix-matched `--resume --fork-session --session-id`
-- delta-only stdin on resumed Claude turns
-- structured request/session telemetry for real Hermes debugging
-- version alignment checks across Node + Python packaging metadata
+- `chat/completions` + `responses` compatibility endpoints
+- request-scoped tool-call nonce enforcement (`<tool_call nonce="...">`)
+- hardened parser paths for malformed tool-call blocks with containment notices
+- optional malformed JSON repair gate (`HERMES_SHIM_JSON_REPAIR_ENABLED=1`)
+- default-on raw log capture with retention caps
+- Claude session reuse + optional in-process live child pool
+- compaction controls, slash commands, and debug stats/quota endpoints
+- npm packaging via Node launcher + Python runtime bootstrap
 
-## Next Up: v0.1.8 — Persistent Session Cache + Debug Surface
+## Next Up: v0.1.31 — Release hygiene and docs alignment
 
-Theme: **"Make resume survive restarts and make state inspectable."**
-
-### Goals
-- optional persistent session cache (`--cache-path ...`) instead of memory-only resume state
-- lightweight debug/stats endpoint for cache/session visibility
-- explicit retention/TTL controls for cached transcripts
-- keep the privacy-sensitive default as in-memory only
-
-## v0.1.9 — Adaptive Timeout + Long-Conversation Resilience
-
-Theme: **"Large conversations should degrade gracefully, not just hang."**
+Theme: **"Ship predictably and keep operator docs truthful."**
 
 ### Goals
-- separate first-token timeout from total timeout
-- size-aware timeout scaling for long prompts
-- transcript trimming / compaction strategy for oversized requests
-- better timeout telemetry in logs and debug endpoints
+- switch publish workflow fully to npm trusted publishing (`id-token: write` + `npm publish --provenance`)
+- remove token-first publish assumptions from maintainer docs
+- align README/ROADMAP/release docs with current behavior (`v0.1.30` reality)
+- keep release checklists compact and reproducible
 
-## v0.2.0 — Tool Call Bridging Without Text Wrappers
+## v0.1.32 — Structured tool-call transport tightening
 
-Theme: **"Move from text conventions to real tool-call semantics."**
+Theme: **"Reduce protocol ambiguity between transcript text and executable tool calls."**
 
 ### Goals
-- prefer structured CLI tool-call output where available
-- reduce reliance on `<tool_call>{...}</tool_call>` wrapper text
-- tighten tool result round-tripping for Hermes
-- preserve compatibility for CLIs that still need wrapper parsing
+- reduce reliance on text wrappers where structured paths already exist
+- keep backward compatibility for CLIs that still emit wrapper-based tool calls
+- strengthen replay/mismatch telemetry without leaking sensitive content
+
+## v0.2.0 — Multi-CLI parity and operational robustness
+
+Theme: **"Claude-specific maturity applied consistently across profiles."**
+
+### Goals
+- close behavior gaps between Claude/Codex/OpenCode profiles
+- improve model discovery and profile capability reporting
+- make long-running streaming + restart behavior more observable and debuggable
 
 ## Design Principles
 
 1. **Hermes remains the real tool executor.**
-2. **Keep the HTTP surface stateless; use sessions as an optimization.**
-3. **Prefer observable behavior over opaque cleverness.**
-4. **Privacy-sensitive persistence must be opt-in.**
+2. **HTTP compatibility first, CLI-specific optimizations second.**
+3. **Observability by default, sensitive payload leakage by default-off.**
+4. **Persistence and debug surfaces should be explicit and controllable.**
 5. **Release only tested, documented cuts.**
-
-## Known Follow-ups
-
-- npm trusted publishing for `@zerople/hermes-shim-http` still needs npm-side setup/verification.
-- Claude model discovery is still based on static aliases (`sonnet`, `opus`, `haiku`).
-- Session reuse is currently Claude-specific; other CLIs still use the safe non-resume path.

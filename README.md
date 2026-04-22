@@ -144,7 +144,7 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 ## Observability and control flags
 
-Useful runtime flags added in `0.1.6`:
+Useful runtime flags (current `v0.1.30`):
 
 ```bash
 npx @zerople/hermes-shim-http \
@@ -180,17 +180,16 @@ Debug / parsing observability env vars:
 
 ---
 
-## What's new in 0.1.7
+## What's new in 0.1.30
 
-For Claude-backed usage, `0.1.7` is the first release where the full intended transport is in place:
+`0.1.30` focused on tool-call protocol hardening and safer observability:
 
-- fresh requests seed Claude with the shim system prompt
-- follow-up requests reuse Claude sessions with `--resume ... --fork-session`
-- resumed turns send only the transcript delta on stdin
-- normal logs stay focused on request/session summaries
-- extra session-cache mismatch detail is opt-in via `HERMES_SHIM_HTTP_DEBUG_SESSION_CACHE=1`
+- request-scoped tool-call nonce enforcement across chat/responses paths
+- prompt rendering hardening so literal transcript markers / `<tool_call>` text inside content do not collide with protocol parsing
+- malformed tool-call containment with structured notice behavior (plus optional `json_repair` gate)
+- default-on raw log capture with rotation caps to avoid unbounded growth
 
-See [`CHANGELOG.md`](./CHANGELOG.md) or [`docs/releases/v0.1.7.md`](./docs/releases/v0.1.7.md) for release notes.
+See [`CHANGELOG.md`](./CHANGELOG.md) for details.
 
 ---
 
@@ -331,7 +330,13 @@ A practical rule of thumb:
 
 ## CLI options
 
-Current launcher help:
+For the full, up-to-date list always check:
+
+```bash
+npx @zerople/hermes-shim-http --help
+```
+
+Key options:
 
 ```text
 --host HOST
@@ -340,8 +345,24 @@ Current launcher help:
 --cwd CWD
 --timeout TIMEOUT
 --model MODELS
+--fallback-model FALLBACK_MODEL
 --profile {auto,claude,codex,opencode,generic}
---doctor
+--cache-path CACHE_PATH
+--cache-ttl-seconds CACHE_TTL_SECONDS
+--cache-max-entries CACHE_MAX_ENTRIES
+--compaction {off,summarize,window}
+--compaction-threshold COMPACTION_THRESHOLD
+--log-level {info,debug}
+--log-format {text,json}
+--heartbeat-wrap | --no-heartbeat-wrap
+--heartbeat-interval HEARTBEAT_INTERVAL
+--single-child-lock | --no-single-child-lock
+--single-child-lock-path SINGLE_CHILD_LOCK_PATH
+--http-heartbeat-interval HTTP_HEARTBEAT_INTERVAL
+--strict-mcp-config | --no-strict-mcp-config
+--live-child-pool | --no-live-child-pool
+--live-child-pool-size LIVE_CHILD_POOL_SIZE
+--live-child-pool-idle-ttl LIVE_CHILD_POOL_IDLE_TTL
 ```
 
 ### Common options
