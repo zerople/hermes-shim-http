@@ -4,6 +4,15 @@ All notable changes to `@zerople/hermes-shim-http` will be documented in this fi
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-04-22
+
+### Fixed
+- **Reduced malformed `<tool_call>` false-positive noise for prompt-echo placeholders.** The parser now suppresses malformed telemetry/raw-log emission for obvious non-protocol placeholder echoes like `<tool_call ...>{...}</tool_call>`, while still refusing to execute them.
+- **Streaming/non-streaming malformed handling now skips empty notices.** When malformed telemetry is intentionally suppressed, no `⚠️ shim: dropped malformed tool_call ...` text is injected into assistant output.
+
+### Tests
+- Added regression coverage for placeholder-echo suppression in both batch and incremental parsing paths, and for direct malformed-event suppression behavior.
+
 ## [0.1.32] - 2026-04-22
 
 ### Fixed
