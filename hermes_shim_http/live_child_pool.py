@@ -94,6 +94,7 @@ class _LiveChild:
         hard_deadline: float | None = None,
         max_output_bytes: int | None = None,
         on_complete=None,
+        expected_tool_call_nonce: str | None = None,
     ) -> Iterator[CliStreamEvent]:
         if self._process.stdin is None:
             raise RuntimeError("LiveChild: stdin pipe unavailable")
@@ -103,7 +104,7 @@ class _LiveChild:
             self._process.stdin.write(self._build_payload(prompt))
             self._process.stdin.flush()
 
-            parser = ClaudeStreamJsonParser(synthesize_progress=False)
+            parser = ClaudeStreamJsonParser(synthesize_progress=False, expected_tool_call_nonce=expected_tool_call_nonce)
             started = time.time()
             last_activity = started
             saw_result = False
@@ -225,6 +226,7 @@ class LiveChildPool:
         hard_deadline: float | None = None,
         max_output_bytes: int | None = None,
         on_complete=None,
+        expected_tool_call_nonce: str | None = None,
     ) -> Iterator[CliStreamEvent]:
         self.sweep()
         child = self._acquire(session_key, spawn_command=spawn_command, cwd=cwd)
@@ -235,6 +237,7 @@ class LiveChildPool:
                 hard_deadline=hard_deadline,
                 max_output_bytes=max_output_bytes,
                 on_complete=on_complete,
+                expected_tool_call_nonce=expected_tool_call_nonce,
             )
         finally:
             with self._lock:

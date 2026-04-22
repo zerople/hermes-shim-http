@@ -2,6 +2,26 @@
 
 All notable changes to `@zerople/hermes-shim-http` will be documented in this file.
 
+## [0.1.30] - 2026-04-21
+
+### Fixed
+- **Transcript marker collision hardening in prompt rendering.** `_render_message_body` now escapes literal marker strings inside message content by inserting U+200B (`----- turn​:` and `-----​ end -----`) at render time, so quoted marker text in assistant/user/tool bodies can no longer be misread as real transcript boundaries by the downstream CLI parser.
+- **Literal `<tool_call>` strings in ordinary message content are now escaped at render time.** Message-body text now rewrites `<tool_call...` / `</tool_call>` with U+200B so protocol-looking examples inside natural-language text cannot be replayed as live tool-call tags.
+- **Request-scoped tool-call nonce enforcement for chat/responses runtime paths.** The server now generates a per-request nonce, injects it into system/transcript prompt guidance (`<tool_call nonce="...">`), and only accepts matching-nonce tool-call blocks during parsing. Mismatched nonce blocks are treated as plain text instead of executable tool invocations.
+- **Malformed `<tool_call>` containment now avoids raw block leakage.** Both `IncrementalToolCallParser._drain` (streaming path) and `parse_cli_output` (batch path) now replace malformed tool-call blocks with a compact structured notice (`⚠️ shim: dropped malformed tool_call ...`) instead of surfacing raw malformed XML/JSON back to assistant text. The parser also emits telemetry (`tool_call_malformed`) with reason + preview and writes full raw blocks to disk when raw-log capture is enabled.
+- **System prompt now explicitly allows `function.arguments` as either JSON-encoded string or raw JSON object.** This matches existing `_normalize_tool_call` behavior and makes model-side formatting drift recoverable without protocol failure.
+
+### Added
+- **Opt-in malformed JSON repair for tool-call blocks.** New env flag `HERMES_SHIM_JSON_REPAIR_ENABLED=1` attempts `json_repair.loads(...)` before dropping malformed tool-call JSON. When repair succeeds, the shim still emits the malformed-block notice with `reason=repaired_from_malformed` for observability.
+- **Raw Claude stream logging is now default-on.** If `HERMES_SHIM_CLAUDE_RAW_LOG_DIR` is unset, logs are written by default to `~/.hermes/hermes-shim-http/raw-logs/`. Explicit empty-string (`HERMES_SHIM_CLAUDE_RAW_LOG_DIR=`) disables capture.
+- **Raw-log rotation in runner.** On each new log creation, old files are pruned by mtime with lightweight caps (max 200 files and ~500 MB total) to avoid unbounded growth.
+
+### Tests
+- Added regression coverage for transcript-marker escaping within message bodies (ensures literal `----- turn:tool -----` in content is escaped and does not appear as a top-level marker), plus message-body `<tool_call>` literal escaping.
+- Added parser tests for malformed tool-call notice behavior (`json_decode_error`, `normalize_rejected`), raw JSON object arguments, request-scoped nonce matching/mismatch behavior, incremental malformed-block containment, and opt-in repair path.
+- Added server-level nonce pinning fixture + nonce-tag response fixtures to assert chat/responses tool-call extraction under strict nonce enforcement.
+- Added runner tests for raw-log directory resolution defaults and explicit opt-out behavior.
+
 ## [0.1.29] - 2026-04-21
 
 ### Fixed

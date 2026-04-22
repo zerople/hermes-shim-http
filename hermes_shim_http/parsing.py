@@ -1,17 +1,86 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import os
+import re
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from .models import CliStreamEvent, ParsedShimOutput
 from .silence import detect_and_strip as _detect_silent
+from .telemetry import emit_event
 
 _JSON_DECODER = json.JSONDecoder()
 _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_CLOSE = "</tool_call>"
+_MALFORMED_NOTICE = "⚠️ shim: dropped malformed tool_call (name={name}, reason={reason}) — see shim logs"
+_MALFORMED_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
+_JSON_REPAIR_ENV = "HERMES_SHIM_JSON_REPAIR_ENABLED"
+_RAW_LOG_ENV = "HERMES_SHIM_CLAUDE_RAW_LOG_DIR"
+_DEFAULT_RAW_LOG_DIR = os.path.expanduser("~/.hermes/hermes-shim-http/raw-logs")
 
 _CLAUDE_IGNORED_DELTA_TYPES = frozenset({"thinking_delta", "signature_delta"})
+
+
+try:
+    from json_repair import loads as _json_repair_loads  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    _json_repair_loads = None
+
+
+def _json_repair_enabled() -> bool:
+    return os.getenv(_JSON_REPAIR_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolved_raw_log_dir() -> str | None:
+    env_value = os.environ.get(_RAW_LOG_ENV)
+    if env_value is None:
+        return _DEFAULT_RAW_LOG_DIR
+    value = env_value.strip()
+    if value == "":
+        return None
+    return os.path.expanduser(value)
+
+
+def _dump_malformed_raw_block(raw_block: str) -> str | None:
+    log_dir = _resolved_raw_log_dir()
+    if not log_dir:
+        return None
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"malformed-tool-call-{ts}-{os.getpid()}.log"
+        path = os.path.join(log_dir, filename)
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(raw_block)
+        return path
+    except OSError:
+        return None
+
+
+def _best_effort_tool_name(raw_block: str) -> str:
+    match = _MALFORMED_NAME_RE.search(raw_block)
+    if not match:
+        return "unknown"
+    return match.group(1) or "unknown"
+
+
+def _malformed_notice(name: str, reason: str) -> str:
+    return _MALFORMED_NOTICE.format(name=name, reason=reason)
+
+
+def _emit_malformed_event(*, raw_block: str, reason: str) -> str:
+    name = _best_effort_tool_name(raw_block)
+    raw_file = _dump_malformed_raw_block(raw_block)
+    emit_event(
+        "tool_call_malformed",
+        name=name,
+        reason=reason,
+        raw_preview=raw_block[:200],
+        full_raw_file=raw_file,
+    )
+    return _malformed_notice(name, reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +113,14 @@ def _normalize_tool_call(raw_obj: dict[str, Any], index: int) -> dict[str, Any] 
     }
 
 
-def _try_extract_tool_call(buffer: str, open_idx: int) -> tuple[int, dict[str, Any]] | None:
-    json_start = open_idx + len(_TOOL_CALL_OPEN)
+def _tool_call_open_tag(expected_tool_call_nonce: str | None) -> str:
+    if expected_tool_call_nonce:
+        return f'<tool_call nonce="{expected_tool_call_nonce}">'
+    return _TOOL_CALL_OPEN
+
+
+def _try_extract_tool_call(buffer: str, open_idx: int, *, tool_call_open_tag: str = _TOOL_CALL_OPEN) -> tuple[int, dict[str, Any]] | None:
+    json_start = open_idx + len(tool_call_open_tag)
     while json_start < len(buffer) and buffer[json_start].isspace():
         json_start += 1
     if json_start >= len(buffer) or buffer[json_start] != "{":
@@ -62,10 +137,35 @@ def _try_extract_tool_call(buffer: str, open_idx: int) -> tuple[int, dict[str, A
     return close_scan + len(_TOOL_CALL_CLOSE), obj
 
 
+def _find_tool_call_block_end(buffer: str, open_idx: int, *, tool_call_open_tag: str = _TOOL_CALL_OPEN) -> int | None:
+    close_idx = buffer.find(_TOOL_CALL_CLOSE, open_idx + len(tool_call_open_tag))
+    if close_idx < 0:
+        return None
+    return close_idx + len(_TOOL_CALL_CLOSE)
+
+
+def _try_repair_tool_call(raw_block: str, *, tool_call_open_tag: str = _TOOL_CALL_OPEN) -> dict[str, Any] | None:
+    if not _json_repair_enabled() or _json_repair_loads is None:
+        return None
+    json_part = raw_block[len(tool_call_open_tag) :]
+    close_idx = json_part.rfind(_TOOL_CALL_CLOSE)
+    if close_idx < 0:
+        return None
+    json_part = json_part[:close_idx].strip()
+    if not json_part.startswith("{"):
+        return None
+    try:
+        repaired = _json_repair_loads(json_part)
+    except Exception:
+        return None
+    return repaired if isinstance(repaired, dict) else None
+
+
 class IncrementalToolCallParser:
-    def __init__(self) -> None:
+    def __init__(self, *, expected_tool_call_nonce: str | None = None) -> None:
         self._buffer = ""
         self._tool_call_count = 0
+        self._tool_call_open_tag = _tool_call_open_tag(expected_tool_call_nonce)
 
     def feed(self, chunk: str) -> list[CliStreamEvent]:
         if not chunk:
@@ -80,26 +180,57 @@ class IncrementalToolCallParser:
         events: list[CliStreamEvent] = []
 
         while True:
-            open_idx = self._buffer.find(_TOOL_CALL_OPEN)
+            open_idx = self._buffer.find(self._tool_call_open_tag)
             if open_idx < 0:
                 break
-            extracted = _try_extract_tool_call(self._buffer, open_idx)
-            if extracted is None:
-                break
-            block_end, obj = extracted
+            extracted = _try_extract_tool_call(self._buffer, open_idx, tool_call_open_tag=self._tool_call_open_tag)
 
             prefix = self._buffer[:open_idx]
             if prefix:
                 events.append(CliStreamEvent(kind="text", text=prefix))
 
-            normalized = _normalize_tool_call(obj, self._tool_call_count + 1)
-            if normalized is None:
-                events.append(CliStreamEvent(kind="text", text=self._buffer[open_idx:block_end]))
-            else:
-                self._tool_call_count += 1
-                events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
+            if extracted is not None:
+                block_end, obj = extracted
+                normalized = _normalize_tool_call(obj, self._tool_call_count + 1)
+                if normalized is None:
+                    notice = _emit_malformed_event(
+                        raw_block=self._buffer[open_idx:block_end],
+                        reason="normalize_rejected",
+                    )
+                    events.append(CliStreamEvent(kind="text", text=notice))
+                else:
+                    self._tool_call_count += 1
+                    events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
+                self._buffer = self._buffer[block_end:]
+                continue
 
-            self._buffer = self._buffer[block_end:]
+            malformed_end = _find_tool_call_block_end(self._buffer, open_idx, tool_call_open_tag=self._tool_call_open_tag)
+            if malformed_end is None:
+                # Wait for more bytes unless we're finalizing.
+                if final:
+                    events.append(CliStreamEvent(kind="text", text=self._buffer[open_idx:]))
+                    self._buffer = ""
+                else:
+                    self._buffer = self._buffer[open_idx:]
+                break
+
+            raw_block = self._buffer[open_idx:malformed_end]
+            repaired = _try_repair_tool_call(raw_block, tool_call_open_tag=self._tool_call_open_tag)
+            if repaired is not None:
+                normalized = _normalize_tool_call(repaired, self._tool_call_count + 1)
+                if normalized is not None:
+                    self._tool_call_count += 1
+                    events.append(CliStreamEvent(kind="tool_call", tool_call=normalized))
+                    notice = _emit_malformed_event(raw_block=raw_block, reason="repaired_from_malformed")
+                    events.append(CliStreamEvent(kind="text", text=notice))
+                else:
+                    notice = _emit_malformed_event(raw_block=raw_block, reason="normalize_rejected")
+                    events.append(CliStreamEvent(kind="text", text=notice))
+            else:
+                notice = _emit_malformed_event(raw_block=raw_block, reason="json_decode_error")
+                events.append(CliStreamEvent(kind="text", text=notice))
+
+            self._buffer = self._buffer[malformed_end:]
 
         if final:
             if self._buffer:
@@ -115,22 +246,21 @@ class IncrementalToolCallParser:
             self._buffer = self._buffer[safe_length:]
         return events
 
-    @staticmethod
-    def _safe_prefix_length(buffer: str) -> int:
+    def _safe_prefix_length(self, buffer: str) -> int:
         if not buffer:
             return 0
 
-        open_index = buffer.find(_TOOL_CALL_OPEN)
+        open_index = buffer.find(self._tool_call_open_tag)
         close_index = buffer.find(_TOOL_CALL_CLOSE)
         candidate_indexes = [idx for idx in (open_index, close_index) if idx >= 0]
         if candidate_indexes:
             return min(candidate_indexes)
 
-        tail_window = max(len(_TOOL_CALL_OPEN), len(_TOOL_CALL_CLOSE)) - 1
+        tail_window = max(len(self._tool_call_open_tag), len(_TOOL_CALL_CLOSE)) - 1
         tail_start = max(0, len(buffer) - tail_window)
         for start in range(tail_start, len(buffer)):
             suffix = buffer[start:]
-            if _TOOL_CALL_OPEN.startswith(suffix) or _TOOL_CALL_CLOSE.startswith(suffix):
+            if self._tool_call_open_tag.startswith(suffix) or _TOOL_CALL_CLOSE.startswith(suffix):
                 return start
 
         return len(buffer)
@@ -151,14 +281,14 @@ class ClaudeStreamJsonParser:
     Anthropic does not stream the body of a thinking block.
     """
 
-    def __init__(self, *, synthesize_progress: bool = False) -> None:
+    def __init__(self, *, synthesize_progress: bool = False, expected_tool_call_nonce: str | None = None) -> None:
         self._line_buffer = ""
         self._blocks: dict[int, dict[str, Any]] = {}
         self._tool_call_count = 0
         self._seen_assistant_msg_ids: set[str] = set()
         self._saw_stream_events = False
         self._saw_any_json = False
-        self._tag_parser = IncrementalToolCallParser()
+        self._tag_parser = IncrementalToolCallParser(expected_tool_call_nonce=expected_tool_call_nonce)
         self._session_id: str | None = None
         self._result_text = ""
         self._result_is_error = False
@@ -367,7 +497,7 @@ def parse_claude_stream_metadata(text: str) -> ClaudeResultMetadata:
     return parser.result_metadata()
 
 
-def parse_claude_stream_json(text: str) -> ParsedShimOutput:
+def parse_claude_stream_json(text: str, *, expected_tool_call_nonce: str | None = None) -> ParsedShimOutput:
     """Parse a complete Claude stream-json blob (one JSON object per line).
 
     Falls back to plain-text `<tool_call>`-tag parsing when the input contains
@@ -376,11 +506,11 @@ def parse_claude_stream_json(text: str) -> ParsedShimOutput:
     """
     if not isinstance(text, str) or not text.strip():
         return ParsedShimOutput(content="", tool_calls=[])
-    parser = ClaudeStreamJsonParser()
+    parser = ClaudeStreamJsonParser(expected_tool_call_nonce=expected_tool_call_nonce)
     events = parser.feed(text if text.endswith("\n") else text + "\n")
     events.extend(parser.finalize())
     if not parser.saw_any_json():
-        return parse_cli_output(text)
+        return parse_cli_output(text, expected_tool_call_nonce=expected_tool_call_nonce)
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     for event in events:
@@ -393,51 +523,55 @@ def parse_claude_stream_json(text: str) -> ParsedShimOutput:
     return ParsedShimOutput(content="" if silent else cleaned, tool_calls=tool_calls, silent=silent)
 
 
-def parse_cli_output(text: str) -> ParsedShimOutput:
+def parse_cli_output(text: str, *, expected_tool_call_nonce: str | None = None) -> ParsedShimOutput:
     if not isinstance(text, str) or not text.strip():
         return ParsedShimOutput(content="", tool_calls=[])
 
     tool_calls: list[dict[str, Any]] = []
-    consumed_spans: list[tuple[int, int]] = []
-
-    cursor = 0
-    while cursor < len(text):
-        open_idx = text.find(_TOOL_CALL_OPEN, cursor)
-        if open_idx < 0:
-            break
-        extracted = _try_extract_tool_call(text, open_idx)
-        if extracted is None:
-            cursor = open_idx + len(_TOOL_CALL_OPEN)
-            continue
-        block_end, obj = extracted
-        normalized = _normalize_tool_call(obj, len(tool_calls) + 1)
-        if normalized is None:
-            cursor = block_end
-            continue
-        tool_calls.append(normalized)
-        consumed_spans.append((open_idx, block_end))
-        cursor = block_end
-
-    if not consumed_spans:
-        cleaned, silent = _detect_silent(text.strip(), has_tool_calls=False)
-        return ParsedShimOutput(content="" if silent else cleaned, tool_calls=[], silent=silent)
-
-    consumed_spans.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in consumed_spans:
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
     parts: list[str] = []
     cursor = 0
-    for start, end in merged:
-        if cursor < start:
-            parts.append(text[cursor:start])
-        cursor = max(cursor, end)
-    if cursor < len(text):
-        parts.append(text[cursor:])
+    tool_call_open_tag = _tool_call_open_tag(expected_tool_call_nonce)
+
+    while cursor < len(text):
+        open_idx = text.find(tool_call_open_tag, cursor)
+        if open_idx < 0:
+            parts.append(text[cursor:])
+            break
+
+        if cursor < open_idx:
+            parts.append(text[cursor:open_idx])
+
+        extracted = _try_extract_tool_call(text, open_idx, tool_call_open_tag=tool_call_open_tag)
+        if extracted is not None:
+            block_end, obj = extracted
+            normalized = _normalize_tool_call(obj, len(tool_calls) + 1)
+            if normalized is None:
+                notice = _emit_malformed_event(raw_block=text[open_idx:block_end], reason="normalize_rejected")
+                parts.append(notice)
+            else:
+                tool_calls.append(normalized)
+            cursor = block_end
+            continue
+
+        malformed_end = _find_tool_call_block_end(text, open_idx, tool_call_open_tag=tool_call_open_tag)
+        if malformed_end is None:
+            parts.append(text[open_idx:])
+            cursor = len(text)
+            break
+
+        raw_block = text[open_idx:malformed_end]
+        repaired = _try_repair_tool_call(raw_block, tool_call_open_tag=tool_call_open_tag)
+        if repaired is not None:
+            normalized = _normalize_tool_call(repaired, len(tool_calls) + 1)
+            if normalized is not None:
+                tool_calls.append(normalized)
+                parts.append(_emit_malformed_event(raw_block=raw_block, reason="repaired_from_malformed"))
+            else:
+                parts.append(_emit_malformed_event(raw_block=raw_block, reason="normalize_rejected"))
+        else:
+            parts.append(_emit_malformed_event(raw_block=raw_block, reason="json_decode_error"))
+
+        cursor = malformed_end
 
     cleaned = "\n".join(part.strip() for part in parts if part and part.strip()).strip()
     cleaned, silent = _detect_silent(cleaned, has_tool_calls=bool(tool_calls))

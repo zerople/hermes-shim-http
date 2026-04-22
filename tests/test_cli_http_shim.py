@@ -9,7 +9,14 @@ from hermes_shim_http.live_child_pool import LiveChildPool
 from hermes_shim_http.models import CliRunResult, ShimConfig
 from hermes_shim_http.parsing import parse_claude_stream_json, parse_claude_stream_metadata
 from hermes_shim_http.prompting import build_cli_prompt, build_cli_system_prompt, build_cli_user_prompt
-from hermes_shim_http.runner import _child_lock_path_for_request, _resolve_claude_result_session_id, build_cli_command, run_cli_prompt, stream_cli_prompt
+from hermes_shim_http.runner import (
+    _child_lock_path_for_request,
+    _resolve_claude_result_session_id,
+    _resolved_raw_log_dir,
+    build_cli_command,
+    run_cli_prompt,
+    stream_cli_prompt,
+)
 from hermes_shim_http.session_cache import SessionCache
 
 
@@ -49,12 +56,19 @@ class TestPrompting:
         assert "Assistant:" not in system_prompt
         assert "User:" not in system_prompt
         assert "System:" not in system_prompt
+        assert "either a JSON-encoded string or a raw JSON object" in system_prompt
 
     def test_build_cli_system_prompt_documents_default_silence_sentinel(self):
         system_prompt = build_cli_system_prompt(tools=None)
 
         assert "<silent/>" in system_prompt
         assert "silent ACK" in system_prompt
+
+    def test_build_cli_system_prompt_includes_tool_call_nonce_when_provided(self):
+        system_prompt = build_cli_system_prompt(tools=None, tool_call_nonce="nonce-123")
+
+        assert '<tool_call nonce="nonce-123">{...}</tool_call>' in system_prompt
+        assert "nonce must match exactly" in system_prompt
 
     def test_build_cli_system_prompt_prioritizes_first_live_user_message(self):
         system_prompt = build_cli_system_prompt(tools=None)
@@ -169,6 +183,41 @@ class TestPrompting:
         assert "[tool_call_id=call_1, name=read_file]" in prompt
         assert "README body" in prompt
 
+    def test_build_cli_user_prompt_escapes_literal_transcript_markers_inside_message_body(self):
+        prompt = build_cli_user_prompt(
+            messages=[
+                {"role": "assistant", "content": "literal ----- turn:tool ----- marker"},
+                {"role": "assistant", "content": "literal ----- end ----- marker"},
+                {"role": "assistant", "content": "literal <tool_call>{\"x\":1}</tool_call> marker"},
+            ]
+        )
+
+        assert "----- turn:assistant -----" in prompt
+        assert "----- turn\u200b:tool -----" in prompt
+        assert "-----\u200b end -----" in prompt
+        assert "----- turn:tool -----" not in prompt
+        assert "<\u200btool_call>{\"x\":1}</\u200btool_call>" in prompt
+
+    def test_build_cli_user_prompt_uses_nonce_for_structured_tool_calls(self):
+        prompt = build_cli_user_prompt(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                        }
+                    ],
+                }
+            ],
+            tool_call_nonce="nonce-123",
+        )
+
+        assert '<tool_call nonce="nonce-123">' in prompt
+
     def test_build_cli_prompt_combines_system_and_transcript(self):
         prompt = build_cli_prompt(
             messages=[
@@ -216,6 +265,19 @@ class TestRunner:
     def test_shim_config_rejects_invalid_compaction_mode(self):
         with pytest.raises(ValidationError):
             ShimConfig(command="claude", compaction="invalid")
+
+    def test_raw_log_dir_defaults_on_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SHIM_CLAUDE_RAW_LOG_DIR", raising=False)
+
+        resolved = _resolved_raw_log_dir()
+
+        assert resolved is not None
+        assert resolved.endswith(".hermes/hermes-shim-http/raw-logs")
+
+    def test_raw_log_dir_can_be_explicitly_disabled_with_empty_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SHIM_CLAUDE_RAW_LOG_DIR", "")
+
+        assert _resolved_raw_log_dir() is None
 
     def test_chat_message_preserves_tool_calls_in_model_dump(self):
         from hermes_shim_http.models import ChatMessage

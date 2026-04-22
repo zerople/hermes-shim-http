@@ -166,6 +166,17 @@ Notes:
 - chat/responses usage objects include fallback `context_tokens_used`, `context_tokens_limit`, and `response_tokens` estimates.
 - slash commands `/clear`, `/compact`, `/model <name>`, and `/stats` are handled as normal assistant responses.
 - long SSE streams emit `: ping` comments during idle periods to avoid proxy/client timeouts.
+- chat/responses runtime now uses request-scoped tool-call nonces (`<tool_call nonce="...">`) and only executes matching-nonce tool-call blocks from CLI output.
+
+Debug / parsing observability env vars:
+
+- `HERMES_SHIM_CLAUDE_RAW_LOG_DIR`
+  - default: `~/.hermes/hermes-shim-http/raw-logs/` (enabled even when unset)
+  - set to a custom path to override
+  - set to empty (`HERMES_SHIM_CLAUDE_RAW_LOG_DIR=`) to disable raw log capture
+- `HERMES_SHIM_JSON_REPAIR_ENABLED=1`
+  - opt-in malformed `<tool_call>` JSON repair using `json_repair`
+  - default is off; when repair succeeds, the shim still emits a malformed-block notice for observability
 
 ---
 

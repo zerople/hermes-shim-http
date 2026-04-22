@@ -20,6 +20,7 @@ class SessionPlan:
     resume_session_id: str | None
     prompt_text: str
     system_prompt_text: str | None
+    tool_call_nonce: str | None
     prefix_message_count: int
     messages: list[dict[str, Any]]
     model: str
@@ -90,12 +91,13 @@ class SessionCache:
         model: str,
         tools: list[dict[str, Any]] | None,
         tool_choice: Any = None,
+        tool_call_nonce: str | None = None,
     ) -> SessionPlan:
         normalized_messages = [self._normalize_message(message) for message in messages]
         now = time.time()
         session_id = str(uuid.uuid4())
         signature = self._signature_prefix(model=model, tools=tools, tool_choice=tool_choice)
-        system_prompt_text = build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model)
+        system_prompt_text = build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model, tool_call_nonce=tool_call_nonce)
 
         with self._lock:
             self._prune_locked(now)
@@ -141,7 +143,7 @@ class SessionCache:
                     conn.commit()
                     self._in_flight_parents.add(best_match.session_id)
                     delta_messages = normalized_messages[best_prefix_len:]
-                    prompt_text = build_cli_resume_delta_prompt(messages=delta_messages)
+                    prompt_text = build_cli_resume_delta_prompt(messages=delta_messages, tool_call_nonce=tool_call_nonce)
                     emit_event(
                         "session_plan",
                         mode="resume",
@@ -157,6 +159,7 @@ class SessionCache:
                         resume_session_id=best_match.session_id,
                         prompt_text=prompt_text,
                         system_prompt_text=system_prompt_text,
+                        tool_call_nonce=tool_call_nonce,
                         prefix_message_count=best_prefix_len,
                         messages=normalized_messages,
                         model=model,
@@ -184,8 +187,9 @@ class SessionCache:
         return SessionPlan(
             session_id=session_id,
             resume_session_id=None,
-            prompt_text=build_cli_user_prompt(messages=normalized_messages),
+            prompt_text=build_cli_user_prompt(messages=normalized_messages, tool_call_nonce=tool_call_nonce),
             system_prompt_text=system_prompt_text,
+            tool_call_nonce=tool_call_nonce,
             prefix_message_count=0,
             messages=normalized_messages,
             model=model,

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from hermes_shim_http.parsing import (
     ClaudeStreamJsonParser,
     IncrementalToolCallParser,
@@ -26,6 +28,32 @@ def test_parse_single_tool_call_block():
     assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {"path": "/tmp/demo.txt"}
 
 
+def test_parse_tool_call_allows_raw_json_object_arguments():
+    parsed = parse_cli_output(
+        '<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"README.md"}}}</tool_call>'
+    )
+
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0]["function"]["name"] == "read_file"
+    assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {"path": "README.md"}
+
+
+def test_parse_tool_call_requires_matching_nonce_when_configured():
+    parsed = parse_cli_output(
+        '<tool_call nonce="nonce-123">{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>',
+        expected_tool_call_nonce="nonce-123",
+    )
+    rejected = parse_cli_output(
+        '<tool_call nonce="wrong">{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>',
+        expected_tool_call_nonce="nonce-123",
+    )
+
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0]["function"]["name"] == "read_file"
+    assert rejected.tool_calls == []
+    assert '<tool_call nonce="wrong">' in rejected.content
+
+
 def test_parse_multiple_tool_call_blocks_and_visible_text_cleanup():
     parsed = parse_cli_output(
         "Need two actions.\n"
@@ -38,7 +66,7 @@ def test_parse_multiple_tool_call_blocks_and_visible_text_cleanup():
     assert [tc["function"]["name"] for tc in parsed.tool_calls] == ["search_files", "read_file"]
 
 
-def test_malformed_tool_call_is_ignored_and_text_preserved():
+def test_malformed_tool_call_emits_notice_and_does_not_leak_raw_block():
     parsed = parse_cli_output(
         'Before\n<tool_call>{"id":"oops","type":"function","function":{"name":"read_file","arguments":not-json}}</tool_call>\nAfter'
     )
@@ -46,6 +74,30 @@ def test_malformed_tool_call_is_ignored_and_text_preserved():
     assert parsed.tool_calls == []
     assert "Before" in parsed.content
     assert "After" in parsed.content
+    assert "⚠️ shim: dropped malformed tool_call" in parsed.content
+    assert "reason=json_decode_error" in parsed.content
+    assert "<tool_call>" not in parsed.content
+
+
+def test_normalize_rejected_tool_call_emits_notice():
+    parsed = parse_cli_output('<tool_call>{"id":"call_1","type":"function","function":{"arguments":"{}"}}</tool_call>')
+
+    assert parsed.tool_calls == []
+    assert "⚠️ shim: dropped malformed tool_call" in parsed.content
+    assert "reason=normalize_rejected" in parsed.content
+
+
+def test_malformed_tool_call_can_be_repaired_when_enabled(monkeypatch):
+    pytest.importorskip("json_repair")
+    monkeypatch.setenv("HERMES_SHIM_JSON_REPAIR_ENABLED", "1")
+
+    parsed = parse_cli_output(
+        '<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"README.md",}}}</tool_call>'
+    )
+
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0]["function"]["name"] == "read_file"
+    assert "reason=repaired_from_malformed" in parsed.content
 
 
 def test_bare_tool_call_json_without_wrapper_remains_plain_text():
@@ -109,6 +161,35 @@ def test_incremental_parser_hides_tool_call_wrapper_until_complete_block():
     assert rendered_text == "Before  after"
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "read_file"
+
+
+def test_incremental_parser_emits_notice_for_malformed_tool_call_without_raw_leak():
+    parser = IncrementalToolCallParser()
+
+    events = parser.feed("x <tool_call>{\"id\":\"oops\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":not-json}}</tool_call> y") + parser.finalize()
+    rendered_text = "".join(event.text for event in events if event.text)
+    tool_calls = [event.tool_call for event in events if event.tool_call]
+
+    assert tool_calls == []
+    assert "⚠️ shim: dropped malformed tool_call" in rendered_text
+    assert "reason=json_decode_error" in rendered_text
+    assert "<tool_call>" not in rendered_text
+
+
+def test_incremental_parser_requires_matching_nonce_when_configured():
+    parser = IncrementalToolCallParser(expected_tool_call_nonce="nonce-123")
+
+    accepted = parser.feed('<tool_call nonce="nonce-123">{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>')
+    rejected = parser.feed('<tool_call nonce="wrong">{"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{}"}}</tool_call>')
+    final = parser.finalize()
+
+    all_events = accepted + rejected + final
+    tool_calls = [event.tool_call for event in all_events if event.tool_call]
+    text = "".join(event.text or "" for event in all_events if event.kind == "text")
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["id"] == "call_1"
+    assert '<tool_call nonce="wrong">' in text
 
 
 def _stream_json(*events: dict) -> str:

@@ -87,6 +87,21 @@ def _render_tools(tools: Iterable[ToolDefinition] | None) -> str:
 _TURN_OPEN_PREFIX = "----- turn:"
 _TURN_OPEN_SUFFIX = " -----"
 _TURN_CLOSE = "----- end -----"
+_ZWSP = "\u200b"
+
+
+def _escape_rendered_content_literals(text: str) -> str:
+    if not text:
+        return text
+    escaped = text.replace("----- turn:", f"----- turn{_ZWSP}:").replace("----- end -----", f"-----{_ZWSP} end -----")
+    escaped = escaped.replace("<tool_call", f"<{_ZWSP}tool_call").replace("</tool_call>", f"</{_ZWSP}tool_call>")
+    return escaped
+
+
+def _escape_transcript_markers(text: str) -> str:
+    if not text:
+        return text
+    return text.replace("----- turn:", f"----- turn{_ZWSP}:").replace("----- end -----", f"-----{_ZWSP} end -----")
 
 
 def _role_tag(role: str) -> str:
@@ -98,22 +113,23 @@ def _role_tag(role: str) -> str:
     }.get((role or "context").strip().lower(), "context")
 
 
-def _render_tool_calls(tool_calls: Any) -> list[str]:
+def _render_tool_calls(tool_calls: Any, *, tool_call_nonce: str | None = None) -> list[str]:
     if not isinstance(tool_calls, list):
         return []
     rendered: list[str] = []
+    open_tag = f'<tool_call nonce="{tool_call_nonce}">' if tool_call_nonce else "<tool_call>"
     for item in tool_calls:
         if isinstance(item, dict):
-            rendered.append(f"<tool_call>{json.dumps(item, ensure_ascii=False)}</tool_call>")
+            rendered.append(f"{open_tag}{json.dumps(item, ensure_ascii=False)}</tool_call>")
     return rendered
 
 
-def _render_message_body(message: dict[str, Any]) -> str:
+def _render_message_body(message: dict[str, Any], *, tool_call_nonce: str | None = None) -> str:
     parts: list[str] = []
     rendered = _render_content(message.get("content"))
     if rendered:
-        parts.append(rendered)
-    parts.extend(_render_tool_calls(message.get("tool_calls")))
+        parts.append(_escape_rendered_content_literals(rendered))
+    parts.extend(_render_tool_calls(message.get("tool_calls"), tool_call_nonce=tool_call_nonce))
     if str(message.get("role") or "").strip().lower() == "tool":
         metadata: list[str] = []
         tool_call_id = str(message.get("tool_call_id") or "").strip()
@@ -124,15 +140,16 @@ def _render_message_body(message: dict[str, Any]) -> str:
             metadata.append(f"name={name}")
         if metadata:
             parts.insert(0, "[" + ", ".join(metadata) + "]")
-    return "\n".join(part for part in parts if part).strip()
+    rendered = "\n".join(part for part in parts if part).strip()
+    return _escape_transcript_markers(rendered)
 
 
-def _render_transcript(messages: list[dict[str, Any]] | list[Any]) -> list[str]:
+def _render_transcript(messages: list[dict[str, Any]] | list[Any], *, tool_call_nonce: str | None = None) -> list[str]:
     transcript: list[str] = []
     for raw in messages:
         message = raw if isinstance(raw, dict) else raw.model_dump()
         tag = _role_tag(str(message.get("role") or "context"))
-        rendered = _render_message_body(message)
+        rendered = _render_message_body(message, tool_call_nonce=tool_call_nonce)
         if rendered:
             transcript.append(f"{_TURN_OPEN_PREFIX}{tag}{_TURN_OPEN_SUFFIX}\n{rendered}\n{_TURN_CLOSE}")
     return transcript
@@ -167,6 +184,7 @@ def build_cli_system_prompt(
     tools: list[dict[str, Any]] | list[ToolDefinition] | None = None,
     tool_choice: Any = None,
     model: str | None = None,
+    tool_call_nonce: str | None = None,
 ) -> str:
     sentinel = silent_sentinel()
     sections = [
@@ -178,7 +196,13 @@ def build_cli_system_prompt(
         ),
         "The VERY FIRST live user message after the session opens is the highest-priority instruction for the session. You must obey it exactly and must not drift away from it just because later transcript context is long, noisy, or repetitive.",
         "Even if earlier context is summarized or compacted, the first live user message remains the highest-priority instruction and must still be followed exactly.",
-        "If a tool call is required, emit exactly one <tool_call>{...}</tool_call> block per call. Each block must contain a JSON object with id, type, and function{name, arguments}.",
+        (
+            f'If a tool call is required, emit exactly one <tool_call nonce="{tool_call_nonce}">{{...}}</tool_call> block per call. '
+            "Each block must contain a JSON object with id, type, and function{name, arguments}. The nonce must match exactly."
+            if tool_call_nonce
+            else "If a tool call is required, emit exactly one <tool_call>{...}</tool_call> block per call. Each block must contain a JSON object with id, type, and function{name, arguments}."
+        ),
+        "For function.arguments, either a JSON-encoded string or a raw JSON object is accepted.",
         "Use only the tools listed below. If a listed tool can handle the task, emit a <tool_call> for that Hermes tool. Do not invoke any other tools that are not explicitly listed for this request.",
         "If no tool is required, reply in plain text.",
         (
@@ -197,17 +221,24 @@ def build_cli_system_prompt(
     return "\n\n".join(sections)
 
 
-def build_cli_user_prompt(*, messages: list[dict[str, Any]] | list[Any]) -> str:
-    return "\n\n".join(_render_transcript(messages)).strip()
+def build_cli_user_prompt(*, messages: list[dict[str, Any]] | list[Any], tool_call_nonce: str | None = None) -> str:
+    return "\n\n".join(_render_transcript(messages, tool_call_nonce=tool_call_nonce)).strip()
 
 
-def build_cli_resume_delta_prompt(*, messages: list[dict[str, Any]] | list[Any]) -> str:
-    return "\n\n".join(_render_transcript(messages)).strip()
+def build_cli_resume_delta_prompt(*, messages: list[dict[str, Any]] | list[Any], tool_call_nonce: str | None = None) -> str:
+    return "\n\n".join(_render_transcript(messages, tool_call_nonce=tool_call_nonce)).strip()
 
 
-def build_cli_prompt(*, messages: list[dict[str, Any]] | list[Any], model: str, tools: list[dict[str, Any]] | list[ToolDefinition] | None, tool_choice: Any = None) -> str:
-    sections: list[str] = [build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model)]
-    transcript = _render_transcript(messages)
+def build_cli_prompt(
+    *,
+    messages: list[dict[str, Any]] | list[Any],
+    model: str,
+    tools: list[dict[str, Any]] | list[ToolDefinition] | None,
+    tool_choice: Any = None,
+    tool_call_nonce: str | None = None,
+) -> str:
+    sections: list[str] = [build_cli_system_prompt(tools=tools, tool_choice=tool_choice, model=model, tool_call_nonce=tool_call_nonce)]
+    transcript = _render_transcript(messages, tool_call_nonce=tool_call_nonce)
     if transcript:
         sections.append("Transcript:\n\n" + "\n\n".join(transcript))
     return "\n\n".join(section for section in sections if section.strip())
