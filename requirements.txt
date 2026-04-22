@@ -1,3 +1,5 @@
 fastapi==0.136.0
 uvicorn==0.44.0
 pydantic==2.13.1
+# Optional: used only when HERMES_SHIM_JSON_REPAIR_ENABLED=1
+json-repair>=0.39.1

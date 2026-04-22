@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from hermes_shim_http import __version__
@@ -12,6 +13,11 @@ from hermes_shim_http.server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FAKE_CLI = REPO_ROOT / "tests" / "fake_cli.py"
+
+
+@pytest.fixture(autouse=True)
+def _fixed_tool_call_nonce(monkeypatch):
+    monkeypatch.setattr("hermes_shim_http.server._new_tool_call_nonce", lambda: "nonce-test")
 
 
 def _client():
@@ -342,7 +348,7 @@ def test_chat_completions_returns_tool_calls():
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(
-            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>',
+            stdout='<tool_call nonce="nonce-test">{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>',
             stderr="",
             exit_code=0,
             duration_ms=10,
@@ -441,7 +447,7 @@ def test_chat_completions_rejects_tool_calls_not_advertised_in_request():
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(
-            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"browser_navigate","arguments":"{\\"url\\":\\"https://example.com\\"}"}}</tool_call>',
+            stdout='<tool_call nonce="nonce-test">{"id":"call_1","type":"function","function":{"name":"browser_navigate","arguments":"{\\"url\\":\\"https://example.com\\"}"}}</tool_call>',
             stderr="",
             exit_code=0,
             duration_ms=10,
@@ -614,7 +620,7 @@ def test_chat_completions_drops_native_claude_tool_without_hermes_equivalent():
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(
-            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"WebSearch","arguments":"{\\"query\\":\\"x\\"}"}}</tool_call>',
+            stdout='<tool_call nonce="nonce-test">{"id":"call_1","type":"function","function":{"name":"WebSearch","arguments":"{\\"query\\":\\"x\\"}"}}</tool_call>',
             stderr="",
             exit_code=0,
             duration_ms=10,
@@ -773,7 +779,7 @@ def test_responses_endpoint_returns_function_call_items():
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(
-            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>',
+            stdout='<tool_call nonce="nonce-test">{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>',
             stderr="",
             exit_code=0,
             duration_ms=10,
@@ -802,13 +808,45 @@ def test_responses_endpoint_returns_function_call_items():
     assert payload["output"][0]["call_id"] == "call_1"
 
 
+def test_responses_endpoint_renders_input_function_call_as_structured_tool_call_in_prompt():
+    client = _client()
+
+    with patch(
+        "hermes_shim_http.server.run_cli_prompt",
+        return_value=CliRunResult(stdout="done", stderr="", exit_code=0, duration_ms=10),
+    ) as mock_run:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "sonnet",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_prev",
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                    {"type": "function_call_output", "call_id": "call_prev", "output": "README body"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    sent_prompt = mock_run.call_args.args[0]
+    assert '<tool_call nonce="nonce-test">' in sent_prompt
+    assert '"id": "call_prev"' in sent_prompt
+    assert '"name": "read_file"' in sent_prompt
+    assert '<\u200btool_call' not in sent_prompt
+
+
 def test_responses_endpoint_rejects_unadvertised_tool_calls():
     client = _client()
 
     with patch(
         "hermes_shim_http.server.run_cli_prompt",
         return_value=CliRunResult(
-            stdout='<tool_call>{"id":"call_1","type":"function","function":{"name":"browser_navigate","arguments":"{\\"url\\":\\"https://example.com\\"}"}}</tool_call>',
+            stdout='<tool_call nonce="nonce-test">{"id":"call_1","type":"function","function":{"name":"browser_navigate","arguments":"{\\"url\\":\\"https://example.com\\"}"}}</tool_call>',
             stderr="",
             exit_code=0,
             duration_ms=10,

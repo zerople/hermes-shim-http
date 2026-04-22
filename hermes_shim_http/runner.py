@@ -43,14 +43,61 @@ _HEARTBEAT_WRAPPER = os.path.join(
     "heartbeat-wrap.py",
 )
 _RAW_LOG_ENV = "HERMES_SHIM_CLAUDE_RAW_LOG_DIR"
+_DEFAULT_RAW_LOG_DIR = os.path.expanduser("~/.hermes/hermes-shim-http/raw-logs")
+_RAW_LOG_MAX_FILES = 200
+_RAW_LOG_MAX_BYTES = 500 * 1024 * 1024
+
+
+def _resolved_raw_log_dir() -> str | None:
+    env_value = os.environ.get(_RAW_LOG_ENV)
+    if env_value is None:
+        return _DEFAULT_RAW_LOG_DIR
+    value = env_value.strip()
+    if value == "":
+        return None
+    return os.path.expanduser(value)
+
+
+def _rotate_raw_logs(log_dir: str) -> None:
+    try:
+        entries = []
+        for name in os.listdir(log_dir):
+            path = os.path.join(log_dir, name)
+            if not os.path.isfile(path):
+                continue
+            stat = os.stat(path)
+            entries.append((stat.st_mtime, stat.st_size, path))
+        entries.sort(key=lambda item: item[0], reverse=True)
+
+        keep: list[tuple[float, int, str]] = []
+        total = 0
+        for item in entries:
+            if len(keep) >= _RAW_LOG_MAX_FILES:
+                continue
+            if total + item[1] > _RAW_LOG_MAX_BYTES:
+                continue
+            keep.append(item)
+            total += item[1]
+
+        keep_paths = {path for _, _, path in keep}
+        for _, _, path in entries:
+            if path in keep_paths:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        return
 
 
 def _open_raw_log(label: str):
-    log_dir = os.environ.get(_RAW_LOG_ENV, "").strip()
+    log_dir = _resolved_raw_log_dir()
     if not log_dir:
         return None
     try:
         os.makedirs(log_dir, exist_ok=True)
+        _rotate_raw_logs(log_dir)
         ts = time.strftime("%Y%m%d-%H%M%S")
         fname = f"claude-raw-{ts}-{os.getpid()}-{label}.log"
         path = os.path.join(log_dir, fname)
@@ -147,11 +194,11 @@ def _pipes_prompt_via_stdin(config: ShimConfig) -> bool:
     return _resolved_profile(config) == "claude"
 
 
-def parse_cli_result(result: CliRunResult, config: ShimConfig) -> ParsedShimOutput:
+def parse_cli_result(result: CliRunResult, config: ShimConfig, *, expected_tool_call_nonce: str | None = None) -> ParsedShimOutput:
     """Parse CLI stdout using the profile-appropriate parser."""
     if _resolved_profile(config) == "claude":
-        return parse_claude_stream_json(result.stdout)
-    return parse_cli_output(result.stdout)
+        return parse_claude_stream_json(result.stdout, expected_tool_call_nonce=expected_tool_call_nonce)
+    return parse_cli_output(result.stdout, expected_tool_call_nonce=expected_tool_call_nonce)
 
 
 def supports_cli_resume(config: ShimConfig) -> bool:
@@ -722,6 +769,7 @@ def stream_cli_prompt(
     disable_builtin_tools: bool = True,
     advertised_tools: list[dict] | None = None,
     live_child_pool: LiveChildPool | None = None,
+    expected_tool_call_nonce: str | None = None,
 ) -> Iterator[CliStreamEvent]:
     use_live_pool = (
         live_child_pool is not None
@@ -779,6 +827,7 @@ def stream_cli_prompt(
                     hard_deadline=config.hard_deadline_seconds,
                     max_output_bytes=config.max_output_bytes,
                     on_complete=captured.append,
+                    expected_tool_call_nonce=expected_tool_call_nonce,
                 )
                 if (
                     captured
@@ -810,6 +859,7 @@ def stream_cli_prompt(
             model=model,
             disable_builtin_tools=disable_builtin_tools,
             advertised_tools=advertised_tools,
+            expected_tool_call_nonce=expected_tool_call_nonce,
         )
 
 
@@ -823,6 +873,7 @@ def _stream_cli_prompt_inner(
     model: str | None = None,
     disable_builtin_tools: bool = True,
     advertised_tools: list[dict] | None = None,
+    expected_tool_call_nonce: str | None = None,
 ) -> Iterator[CliStreamEvent]:
     with request_scoped_mcp_config(tools=advertised_tools if _resolved_profile(config) == "claude" else None) as mcp_config_path:
         stdin_prompt = _stdin_prompt_text(
@@ -882,7 +933,11 @@ def _stream_cli_prompt_inner(
         total_bytes = 0
         max_bytes = config.max_output_bytes
         hard_deadline = config.hard_deadline_seconds
-        parser = ClaudeStreamJsonParser(synthesize_progress=False) if _resolved_profile(config) == "claude" else IncrementalToolCallParser()
+        parser = (
+            ClaudeStreamJsonParser(synthesize_progress=False, expected_tool_call_nonce=expected_tool_call_nonce)
+            if _resolved_profile(config) == "claude"
+            else IncrementalToolCallParser(expected_tool_call_nonce=expected_tool_call_nonce)
+        )
         exit_code: int | None = None
 
         stdout_thread = threading.Thread(
